@@ -13,6 +13,24 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Lean data path, round 1 (branch `lean`): smaller records, own Parquet writer, huge-page tables
+- **Context:** Goal < 0.4 s from 1.9925 s (top of the board 0.4218 s). Probe #4 put the biggest cost on writing records into fresh memory (0.46 s of 1.33 s parse at 20M), and a local Linux `perf` profile shows ~21% of all CPU in the kernel zeroing and compacting fresh pages. On this Mac, writing user_daily with the parquet crate cost more CPU than the person pass itself
+- **Options:** A) A ground-up rewrite (registry of dense person indices, streaming reads): too big to make exact by the deadline. B) Keep the design (dedup bucket by event_id, person bucket by person) and cut every byte and pass it doesn't need
+- **Chose:** B, in steps, each checked (unit tests, 36/36 fixtures, dev answer, Rust = Polars on 5-10 seeds, same 2M checksum):
+  - Records: dedup record 32 -> 24 B (32-bit reference to its event), event 40 -> 24 B (u32 ms offsets; price, category and the dead flag in one u32), click 40 -> 24 B. Person keys in records are 64 bits (two different names would collide about once in 10^7 runs at 60M); linked-ID keys stay 128 bits, event_id dedup stays exact
+  - Blocks: one reserved arena (sized from the input), lock-free bump pointer, 4 KB blocks cut from per-thread 1 MB chunks, one tail pointer per list on the hot path
+  - hashbrown took its slot tags from the hash's top bits, which within a bucket are all equal (they picked the bucket): tables now get rotated bits
+  - Own Parquet writer: one row group, PLAIN pages, Thrift footer by hand, one write per file. pyarrow, DuckDB and Polars read it (also 0-row files); write CPU 4-5x lower
+  - Two-phase scanner per 64 KB window (comma positions written 8 at a time, then a tight loop over lines); fuzz-tested against the old one, also across window ends
+  - Event type by length and one integer compare (no memcmp); small tables read while links build; 256 KB link chunks; input unmapped in parallel at the end
+  - Linked-ID table and Bloom filter in one 2 MB-aligned huge-page mapping (the scorer only gives huge pages when asked)
+- **Pros:**
+  - Linux proxy (2M events, 4 threads, 10-12 interleaved runs): wall min/median 0.227/0.249 s (old) -> 0.161/0.201 s (records + writer) -> 0.153/0.171 s (scanner etc.)
+- **Cons / risks:**
+  - The proxy can't show the scorer's memory costs; probe #5 (branch `probe5`) measures the new build there, with 4 KB pages, with 512 buckets, the old build, and 60M
+  - `SHOPPING_THP=0` (probes only) switches the arena to 4 KB pages
+- **Result:** (pending submission of `lean`)
+
 ## Measured on the scorer (probe #3): what to keep
 - **Context:** Probe #3 timed 10 setups on 20M generated events on the scorer (best of 2; same output checksum for all)
 - **Kept:**
