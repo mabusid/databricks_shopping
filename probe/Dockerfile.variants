@@ -29,5 +29,5 @@ COPY --from=build /bin-out /app/bin
 COPY --from=build /generate /app/generate
 COPY --from=build /writer /app/writer
 COPY probe/run_rows.sh /app/run.sh
-COPY probe/configs* /app/
+COPY probe/configs probe/probe60 /app/
 CMD ["/bin/bash", "/app/run.sh"]

@@ -1221,9 +1221,15 @@ fn run() {
             ]);
         }
         if !u.is_empty() {
-            output::write_table(&out, "user_daily", 900, output::USER_DAILY, vec![
+            // The same schema as the real parts (INT32 counts in compact mode).
+            let (schema, sessions, events) = if compact {
+                (output::USER_DAILY_32, Column::I32((0..u.len() as i32).collect()), Column::I32(vec![0; u.len()]))
+            } else {
+                (output::USER_DAILY, Column::I64(n(u.len())), Column::I64(vec![0; u.len()]))
+            };
+            output::write_table(&out, "user_daily", 900, schema, vec![
                 Column::Str(u.iter().map(|r| r.0).collect()), Column::Date(vec![base_day as i32; u.len()]),
-                Column::I64(n(u.len())), Column::I64(vec![0; u.len()]), Column::I64(vec![0; u.len()]),
+                sessions, events, Column::I64(vec![0; u.len()]),
                 Column::OptStr(u.iter().map(|r| Some(r.1)).collect()),
             ]);
         }
