@@ -25,7 +25,7 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
 2. [x] Choose an engine (log it in DECISIONS.md): Polars
 3. [x] Clean the logs (checked by `tests/check_steps.py`)
 4. [x] Join each person's IDs (checked by `tests/check_steps.py`)
-5. [ ] Build sessions
+5. [x] Build sessions (`user_daily` matches all 36 fixtures and the dev answer)
 6. [ ] Credit sessions to ad clicks, count assisting campaigns
 7. [ ] All 36 fixtures pass → first submission
 8. [ ] Profile and optimize, one change per submission

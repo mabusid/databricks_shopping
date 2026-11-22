@@ -6,8 +6,9 @@ Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
 
-Status: steps 3 (clean the logs) and 4 (join each person's IDs) are done.
-Steps 5-6 are still to do, so the output tables are still written empty.
+Status: steps 3-5 (clean the logs, join each person's IDs, build sessions)
+are done, so user_daily is complete. Step 6 (clicks) is still to do, so
+campaign_daily is still written empty.
 """
 import glob
 import json
@@ -28,6 +29,7 @@ SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 
 DAY_MS = 86_400_000
 WEEK_MS = 7 * DAY_MS
+SESSION_GAP_MS = 30 * 60 * 1000
 MAX_PRICE = 10_000_000
 
 EVENT_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
@@ -279,6 +281,68 @@ def with_person(frame, names):
     )
 
 
+# --- Sessions (README step 5) --------------------------------------------------
+def sessionize(events):
+    """Events rules 5-6: give each event its session (an id), start (ms) and day.
+
+    Sorted by person and ts, a session starts at a person's first event and
+    wherever the gap from the previous event is over 30 minutes. Events with
+    equal ts have a gap of 0, so they always share a session; when ts changes,
+    the previous event holds the previous distinct ts, so the gap is measured
+    between distinct timestamps, as the rules say.
+    """
+    ts, person = pl.col("ts"), pl.col("person")
+    new_session = ((person != person.shift(1)) | (ts - ts.shift(1) > SESSION_GAP_MS)).fill_null(True)
+    return (
+        events.sort("person", "ts")
+        .with_columns(new_session.cum_sum().alias("session"))
+        .with_columns(ts.min().over("session").alias("start"))
+        .with_columns(utc_date(pl.col("start")).alias("day"))  # rule 6: the start's UTC date
+    )
+
+
+def utc_date(ms):
+    """ms since the epoch -> its UTC calendar date."""
+    return (ms // DAY_MS).cast(pl.Int32).cast(pl.Date)
+
+
+def session_table(sessionized):
+    """One row per session: person, start, day, events, revenue_cents, purchases."""
+    return sessionized.group_by("session").agg(
+        pl.col("person").first(),
+        pl.col("start").first(),
+        pl.col("day").first(),
+        pl.len().cast(pl.Int64).alias("events"),
+        pl.col("price_cents").sum().alias("revenue_cents"),  # 0 for views and carts
+        (pl.col("event_type") == "purchase").sum().cast(pl.Int64).alias("purchases"),
+    )
+
+
+def user_daily(sessionized, sessions, products):
+    """The user_daily table: one row per person and day with a session."""
+    totals = sessions.group_by("person", "day").agg(
+        pl.len().cast(pl.Int64).alias("sessions"),
+        pl.col("events").sum(),
+        pl.col("revenue_cents").sum(),
+    )
+    # Rule 7: a product not in products.csv is `unknown`, which competes like any category.
+    # top_category: the highest summed purchase price; a tie goes to the byte-wise smallest.
+    top = (
+        sessionized.filter(pl.col("event_type") == "purchase")
+        .join(products.lazy(), on="product_id", how="left")
+        .with_columns(pl.col("category").fill_null("unknown"))
+        .group_by("person", "day", "category").agg(pl.col("price_cents").sum().alias("total"))
+        .group_by("person", "day").agg(
+            pl.col("category").sort_by("total", "category", descending=[True, False]).first()
+            .alias("top_category"))
+    )
+    return (
+        totals.join(top, on=["person", "day"], how="left")  # null top_category: no purchases
+        .select(pl.col("person").alias("user_id"), "day", "sessions", "events", "revenue_cents",
+                "top_category")
+    )
+
+
 # --- Output --------------------------------------------------------------------
 USER_DAILY = {
     "user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
@@ -298,19 +362,27 @@ def main():
     print("window:", manifest["window_start"], "to", manifest["window_end"])
     print("polars threads:", pl.thread_pool_size())
 
-    products = read_table(os.path.join(DATA, "products.csv"), PRODUCT_COLS)  # noqa: F841 (step 5)
+    products = read_table(os.path.join(DATA, "products.csv"), PRODUCT_COLS)
     campaigns = read_table(os.path.join(DATA, "campaigns.csv"), CAMPAIGN_COLS)
     names = person_names(clean_links(DATA))
-    events = with_person(clean_events(DATA, start, end), names)  # noqa: F841 (steps 5-6)
+    events = with_person(clean_events(DATA, start, end), names)
     clicks = with_person(clean_clicks(DATA, start, end, campaigns), names)  # noqa: F841 (step 6)
 
-    # TODO steps 5-6: build sessions, credit clicks and assists.
-    # Until then both tables are written empty, with the exact schema.
-    for name, schema in (("user_daily", USER_DAILY), ("campaign_daily", CAMPAIGN_DAILY)):
-        folder = os.path.join(OUT, name)
-        os.makedirs(folder, exist_ok=True)
-        pl.DataFrame(schema=schema).write_parquet(os.path.join(folder, "part-0.parquet"))
-    print("wrote empty user_daily and campaign_daily (steps 5-6 to do)")
+    sessionized = sessionize(events).collect()
+    sessions = session_table(sessionized.lazy()).collect()
+    write_table(user_daily(sessionized.lazy(), sessions.lazy(), products).collect(), "user_daily", USER_DAILY)
+
+    # TODO step 6: credit clicks and assists. Until then campaign_daily is written empty.
+    write_table(pl.DataFrame(schema=CAMPAIGN_DAILY), "campaign_daily", CAMPAIGN_DAILY)
+    print("wrote user_daily and an empty campaign_daily (step 6 to do)")
+
+
+def write_table(frame, name, schema):
+    """Write one output table, with exactly the columns and types of `schema`."""
+    folder = os.path.join(OUT, name)
+    os.makedirs(folder, exist_ok=True)
+    frame.select(pl.col(c).cast(t) for c, t in schema.items()).write_parquet(
+        os.path.join(folder, "part-0.parquet"))
 
 
 if __name__ == "__main__":

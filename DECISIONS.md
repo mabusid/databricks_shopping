@@ -13,6 +13,17 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Sessions: one sort, gap flags, running sum
+- **Context:** Step 5 splits each person's events into sessions at gaps over 30 minutes; events with equal timestamps must share a session
+- **Options:** A) Sort all events by (person, ts), flag a new session where the person changes or the gap to the previous row is over 30 min, then take a running sum of the flags as the session id. B) Window functions per person (`over("person")`)
+- **Chose:** A
+- **Pros:**
+  - One sort for everyone, with no per-group windows
+  - Equal timestamps have a gap of 0, so they share a session with no special case
+- **Cons / risks:**
+  - The sort is on a string key, which may be slow at 60M rows; numbering persons as integers could help (step 8)
+- **Result:** — (no submission yet). `user_daily` matches all 36 fixtures and the dev answer exactly (118,107 rows)
+
 ## Linked IDs: scipy connected components
 - **Context:** Step 4 must merge each person's IDs, through chains hundreds of links long and shared devices joining thousands of people
 - **Options:** A) Number the IDs in byte order, then use scipy's `connected_components`. B) Repeated min-label passes in Polars. C) Union-find in plain Python

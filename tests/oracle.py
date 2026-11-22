@@ -155,3 +155,61 @@ def people(data_dir):
     for x in list(parent):
         members.setdefault(find(x), []).append(x)
     return {x: min(group) for group in members.values() for x in group}  # str min is byte-wise for UTF-8
+
+
+GAP_MS = 30 * 60 * 1000
+
+
+def day_of(ms):
+    return (EPOCH + timedelta(milliseconds=ms)).date()
+
+
+def sessions(data_dir):
+    """Events rules 5-6. List of dicts: person, start, day, events (the event tuples)."""
+    names = people(data_dir)
+    by_person = {}
+    for event in clean_events(data_dir):
+        by_person.setdefault(names.get(event[1], event[1]), []).append(event)
+    out = []
+    for person, events in by_person.items():
+        # Walk the person's distinct timestamps; each one joins the session the
+        # previous distinct one is in, unless the gap is over 30 minutes.
+        start_of = {}  # ts -> its session's start
+        start = previous = None
+        for t in sorted({e[2] for e in events}):
+            if previous is None or t - previous > GAP_MS:
+                start = t
+            start_of[t] = start
+            previous = t
+        grouped = {}
+        for event in events:
+            grouped.setdefault(start_of[event[2]], []).append(event)
+        for start, members in grouped.items():
+            out.append({"person": person, "start": start, "day": day_of(start), "events": members})
+    return out
+
+
+def products(data_dir):
+    path = os.path.join(data_dir, "products.csv")
+    return dict(v for v in (fields_of(line, 2) for line in lines_of(path)) if v is not None)
+
+
+def user_daily(data_dir):
+    """Set of (user_id, day, sessions, events, revenue_cents, top_category)."""
+    category = products(data_dir)
+    days = {}
+    for s in sessions(data_dir):
+        d = days.setdefault((s["person"], s["day"]), {"sessions": 0, "events": 0, "revenue": 0, "spend": {}})
+        d["sessions"] += 1
+        d["events"] += len(s["events"])
+        for _, _, _, etype, product, price in s["events"]:
+            if etype == "purchase":
+                d["revenue"] += price
+                c = category.get(product, "unknown")
+                d["spend"][c] = d["spend"].get(c, 0) + price
+    out = set()
+    for (person, day), d in days.items():
+        # Highest spend; a tie goes to the byte-wise smallest category.
+        top = min(d["spend"].items(), key=lambda kv: (-kv[1], kv[0]))[0] if d["spend"] else None
+        out.add((person, day, d["sessions"], d["events"], d["revenue"], top))
+    return out
