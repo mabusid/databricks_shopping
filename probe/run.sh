@@ -13,7 +13,7 @@ run() { # run LABEL BIN DATA [VAR=VALUE...]
   local label=$1 bin=$2 data=$3; shift 3
   rm -rf "$S/o"; mkdir -p "$S/o"
   local t=$EPOCHREALTIME
-  env "$@" DATA_DIR="$data" OUTPUT_DIR="$S/o" timeout 40 "$bin" 2>&1 | sed "s/^/[$label] /"
+  env "$@" SHOPPING_CHECKSUM=1 DATA_DIR="$data" OUTPUT_DIR="$S/o" timeout 40 "$bin" 2>&1 | sed "s/^/[$label] /"
   echo "[$label] wall $(awk "BEGIN{printf \"%.3f\", $EPOCHREALTIME - $t}")s exit ${PIPESTATUS[0]}"
 }
 
@@ -37,6 +37,9 @@ grep -E " (/data|/scratch|/output|/tmp|/) " /proc/self/mountinfo
 ulimit -a | grep -iE "open|proc|stack|locked"
 du -sh "$D"/* 2>&1; ls "$D/events" | wc -l
 command -v fincore >/dev/null && fincore "$D"/events/*.csv | tail -4 || echo "no fincore"
+
+sec "v3 unit tests on this CPU (scanner fuzz test, timestamps)"
+[ "$(uname -m)" = x86_64 ] && timeout 60 /app/shopping-v3-tests 2>&1 | tail -8
 
 sec "dev set, both builds, twice"
 for i in 1 2; do run "dev base $i" /app/shopping-base "$D"; run "dev v3 $i" /app/shopping-v3 "$D"; done

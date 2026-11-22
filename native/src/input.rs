@@ -138,7 +138,25 @@ fn eq_mask(w: u64, b: u8) -> u64 {
 /// Bitmasks, one bit per byte, of the commas, quotes and newlines in a 64-byte
 /// block (simdjson's "stage 1"). SSE2 on x86-64 (every x86-64 CPU has it),
 /// NEON on arm64, plain 8-byte words elsewhere.
-#[cfg(target_arch = "x86_64")]
+/// AVX2 (the x86-64-v3 build only): two 32-byte compares per character.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: this build requires AVX2 (the launcher checks the CPU); loads are unaligned and in bounds.
+    unsafe {
+        let lo = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(b.as_ptr().add(32) as *const __m256i);
+        let mask = |x: u8| -> u64 {
+            let v = _mm256_set1_epi8(x as i8);
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v)) as u32 as u64) << 32)
+        };
+        (mask(b','), mask(b'"'), mask(b'\n'))
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 #[inline(always)]
 fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;

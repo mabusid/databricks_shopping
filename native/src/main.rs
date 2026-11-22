@@ -1035,6 +1035,28 @@ fn run() {
         parts.push(&[]); // still write one (empty) file with the schema
     }
     let user_rows: usize = parts.iter().map(|p| p.len()).sum();
+    // SHOPPING_CHECKSUM=1: an order-independent checksum of both tables, so a
+    // probe can check on the scorer that two builds wrote the same rows.
+    if std::env::var("SHOPPING_CHECKSUM").is_ok() {
+        let row = |fields: &[&[u8]]| {
+            let mut buf = Vec::new();
+            for f in fields {
+                buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+                buf.extend_from_slice(f);
+            }
+            xxhash_rust::xxh3::xxh3_64(&buf)
+        };
+        let users = parts.iter().flat_map(|p| p.iter()).fold(0u64, |acc, u| {
+            let top = u.top.map_or(&b"\xffnull"[..], |c| category_names[c as usize]);
+            acc.wrapping_add(row(&[u.person, &u.day.to_le_bytes(), &u.sessions.to_le_bytes(),
+                                   &u.events.to_le_bytes(), &u.revenue.to_le_bytes(), top]))
+        });
+        let campaign = (0..cols.0.len()).fold(0u64, |acc, i| {
+            acc.wrapping_add(row(&[cols.0[i], cols.1[i], &cols.2[i].to_le_bytes(), &cols.3[i].to_le_bytes(),
+                                   &cols.4[i].to_le_bytes(), &cols.5[i].to_le_bytes(), &cols.6[i].to_le_bytes()]))
+        });
+        eprintln!("checksum user_daily {user_rows} rows {users:016x}  campaign_daily {} rows {campaign:016x}", cols.0.len());
+    }
     rayon::join(
         || {
             parts.par_iter().enumerate().for_each(|(part, users)| {
