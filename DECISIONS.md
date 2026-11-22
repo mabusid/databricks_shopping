@@ -13,6 +13,18 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Measured on the scorer (probe #3): what to keep
+- **Context:** Probe #3 timed 10 setups on 20M generated events on the scorer (best of 2; same output checksum for all)
+- **Kept:**
+  - Events: one shuffle instead of two, clicks in the same pass (`c2fc1b8`), word-at-a-time timestamps (`f51c5ab`), `user_daily` parts written per group of buckets during the person pass (`e18d907`). Together: 2.574 → 2.103 s (−18%). The overlapped write is most of it: person pass + write 0.83 → 0.40 s
+  - The x86-64-v3 build via the launcher: 2.630 → 2.574 s (−2%); its AVX2 unit tests pass on the scorer
+- **Dropped (off by default; knobs stay for probes):**
+  - Compact Parquet encodings: 2.185 s, slower (encoding CPU costs more than the bytes saved)
+  - pread input instead of mmap: 2.287 s, slower
+  - Prefetch depth 16 (2.140), click prefetch ring (2.111): no gain
+  - 2048 buckets (2.221), 16 threads (2.229): slower
+- **Result:** pending (the real submission of `step2` HEAD)
+
 ## Scorer probes, and bundling changes they measured
 - **Context:** Practice runs hide our logs, and the local proxy can't show the scorer's costs (huge pages, mmap faults, how /data is mounted, exit teardown, AVX2). We are at 2.0876 s; the top is 0.4293 s, with ~7.5 h and 2 submissions an hour left. When a submission fails on the dev set, the scorer returns our logs
 - **Options:** A) Probe submissions: generate 20M (and 60M) events inside the container, time several builds and microbenchmarks there, then fail the dev check on purpose with one made-up `campaign_daily` row. B) Keep measuring only on the proxy
