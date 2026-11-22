@@ -620,14 +620,17 @@ fn person_names(links_dir: &Path) -> Links {
         .collect();
     // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
     let bits = (n * 8).max(1 << 16).next_power_of_two();
-    let mut links = Links { parts, zero, bloom: vec![0u64; bits / 64], bloom_mask: (bits / 512 - 1) as u64 };
-    for p in 0..LINK_PARTS {
-        for &k in &numbered[p].0 {
+    let mut links = Links { parts, zero, bloom: Vec::new(), bloom_mask: (bits / 512 - 1) as u64 };
+    // Set every key's two bits, all parts in parallel (atomic OR; order doesn't matter).
+    let words: Vec<std::sync::atomic::AtomicU64> = (0..bits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    numbered.par_iter().for_each(|(keys, _, _)| {
+        for &k in keys {
             let (a, b) = links.bloom_bits(k);
-            links.bloom[a / 64] |= 1 << (a % 64);
-            links.bloom[b / 64] |= 1 << (b % 64);
+            words[a / 64].fetch_or(1 << (a % 64), Relaxed);
+            words[b / 64].fetch_or(1 << (b % 64), Relaxed);
         }
-    }
+    });
+    links.bloom = words.into_iter().map(|w| w.into_inner()).collect();
     links
 }
 
