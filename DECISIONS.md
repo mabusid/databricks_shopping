@@ -13,6 +13,17 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Scorer probes, and bundling changes they measured
+- **Context:** Practice runs hide our logs, and the local proxy can't show the scorer's costs (huge pages, mmap faults, how /data is mounted, exit teardown, AVX2). We are at 2.0876 s; the top is 0.4293 s, with ~7.5 h and 2 submissions an hour left. When a submission fails on the dev set, the scorer returns our logs
+- **Options:** A) Probe submissions: generate 20M (and 60M) events inside the container, time several builds and microbenchmarks there, then fail the dev check on purpose with one made-up `campaign_daily` row. B) Keep measuring only on the proxy
+- **Chose:** A, the user's decision. Also the user's decision: a real submission may bundle several changes that probes measured one by one, instead of one change per submission
+- **Pros:**
+  - Real stage timings on the scorer, A/B of several builds per slot, and the 60M peak-memory check CLAUDE.md asks for
+- **Cons / risks:**
+  - Each probe uses one of the 2 slots an hour and scores nothing
+  - `probe/Dockerfile` replaces the root Dockerfile only on a `probe` branch; main keeps building the real pipeline. `SHOPPING_PROBE` and `SHOPPING_FAKE_ROW` are off unless set
+- **Result:** pending (probe #1)
+
 ## Experiment: 1024 buckets for large inputs, with block lists
 - **Context:** At 20M events, 256 buckets mean ~78k events per dedup table (~1.25 MB), beyond a Xeon core's 1 MB L2. Attempt #6 tried 2048 buckets with growing `Vec`s and lost ~0.06 s, mostly from scattering into fresh, pre-reserved memory. Block lists (#13) have since made the scatter cheap
 - **Options:** A) 1024 buckets when the events exceed 1 GB (~10M+; ~20k events per table at 20M), else 256. B) Stay at 256
@@ -23,7 +34,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Wider scatter (1024 list tails per thread) and more partly filled blocks
   - If the score gets worse, revert to 256
   - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds at 1024 buckets (forced) and at 256
-- **Result:** — (attempt #17 pending)
+- **Result:** Submitted with #16 (newest commit, `7642935` code): 2.1554 → 2.0876 s for both changes. Not worse overall, so 1024 buckets stays
 
 ## Tried and dropped: the prefetch pipeline for clicks
 - Same technique as #16, applied to click lookups. Linux proxy (2M, 16 interleaved runs vs #16): best 0.212 vs 0.212 s, median 0.293 vs 0.244 s. No gain (click lookups are a small cost), so not kept
@@ -38,7 +49,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Records leave the parse in a slightly different order, which doesn't matter: dedup keeps the smallest ingest_ts, and tied copies are identical
   - Checks: unit tests, 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
-- **Result:** — (attempt #16 pending)
+- **Result:** Submitted with #17 (newest commit, `7642935` code): 2.1554 → 2.0876 s for both changes
 
 ## Compact records: 8-byte string slices
 - **Context:** The parse-pass split (Linux, 2M) still put the biggest cost on writing records into fresh memory: + 0.09–0.13 s for fresh block lists against + 0.03–0.04 s reused. That cost scales with the bytes written

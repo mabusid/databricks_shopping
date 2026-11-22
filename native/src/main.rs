@@ -15,6 +15,7 @@ mod blocks;
 mod input;
 mod output;
 mod parse;
+mod probe;
 
 use foldhash::fast::FixedState;
 use hashbrown::hash_map::Entry;
@@ -837,6 +838,11 @@ fn main() {
     if let Some(n) = std::env::var("NCPU").ok().and_then(|n| n.parse::<usize>().ok()) {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
     }
+    // SHOPPING_PROBE=DIR: machine microbenchmarks for a probe submission (never in a scored run).
+    if let Ok(dir) = std::env::var("SHOPPING_PROBE") {
+        probe::run(Path::new(&dir));
+        return;
+    }
     // SHOPPING_REPEAT=N runs the whole pipeline N times: only for profiling.
     let repeat = std::env::var("SHOPPING_REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
     for _ in 0..repeat {
@@ -1049,6 +1055,27 @@ fn run() {
             ])
         },
     );
+    // SHOPPING_FAKE_ROW=1 adds one made-up campaign_daily row, only so a probe
+    // submission fails the dev check on purpose and the scorer shows its logs.
+    if std::env::var("SHOPPING_FAKE_ROW").is_ok() {
+        output::write_table(&out, "campaign_daily", 1, output::CAMPAIGN_DAILY, vec![
+            Column::Str(vec![b"probe_fake"]), Column::Str(vec![b"probe_fake"]), Column::Date(vec![base_day as i32]),
+            Column::I64(vec![1]), Column::I64(vec![0]), Column::I64(vec![0]), Column::I64(vec![0]),
+        ]);
+    }
     log(&format!("wrote {user_rows} user_daily rows"));
+    log_rusage();
     std::mem::forget(tallies); // freeing costs time and the process ends now
+}
+
+/// CPU time, page faults and peak memory of the run so far, to stderr.
+fn log_rusage() {
+    // SAFETY: getrusage only writes the struct it is given.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    // ru_maxrss is in KB on Linux, bytes on macOS.
+    let rss_mb = if cfg!(target_os = "macos") { u.ru_maxrss as f64 / 1e6 } else { u.ru_maxrss as f64 / 1e3 };
+    eprintln!("rusage  user {:.3}s  sys {:.3}s  minflt {}  majflt {}  maxrss {:.0} MB  nvcsw {}  nivcsw {}",
+              secs(u.ru_utime), secs(u.ru_stime), u.ru_minflt, u.ru_majflt, rss_mb, u.ru_nvcsw, u.ru_nivcsw);
 }
