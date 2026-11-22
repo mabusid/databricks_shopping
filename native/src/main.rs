@@ -947,6 +947,9 @@ fn main() {
     }
 }
 
+static PB_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn run() {
     let t0 = Instant::now();
     let log = |what: &str| eprintln!("{:8.3}s  {what}", t0.elapsed().as_secs_f64());
@@ -1156,13 +1159,17 @@ fn run() {
         groups.into_par_iter().enumerate().for_each(|(gi, group)| {
             let mut users = Users::default();
             for (evs, cks) in group {
+                let tq = Instant::now();
                 person_bucket(&evs, &cks, &cx, &mut acc(), &mut users);
+                PB_NS.fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 evs.into_iter().for_each(BlockList::release);
                 cks.into_iter().for_each(BlockList::release);
             }
             for (k, rows) in [&users.top, &users.no_top].into_iter().enumerate() {
                 if !rows.is_empty() {
+                    let tq = Instant::now();
                     write_users(2 * gi + k, rows);
+                    WR_NS.fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     user_rows.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
                     if checksum {
                         let h = rows.iter().fold(0u64, |a, u| a.wrapping_add(user_hash(u)));
@@ -1181,7 +1188,7 @@ fn run() {
     for t in &tallies {
         tally.add_counts(t);
     }
-    log("sessions, credit, assists and user_daily");
+    log(&format!("sessions, credit, assists and user_daily (cpu: person {:.3}s, write {:.3}s)", PB_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9, WR_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9));
 
     // campaign_daily.
     let mut cols = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
