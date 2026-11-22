@@ -37,6 +37,7 @@ LINK_COLS = ["user_id_a", "user_id_b"]
 PRODUCT_COLS = ["product_id", "category"]
 CAMPAIGN_COLS = ["campaign_id", "channel"]
 EVENT_TYPES = ["view", "cart", "purchase"]
+EVENT_TYPE = pl.Enum(EVENT_TYPES)
 
 
 # --- Reading lines -------------------------------------------------------------
@@ -183,38 +184,54 @@ def csv_files(folder):
 def clean_events(data_dir, start, end):
     """Events rules 1-4: parse, dedup, validate, drop late.
 
-    Columns: event_id, user_id, ts (ms), event_type, product_id,
+    Columns: event_id, user_id, ts (ms), event_type (an Enum), product_id,
     price_cents (the price for a purchase, 0 otherwise).
+
+    Whether a copy is valid and on time depends only on that copy's own fields,
+    so it is worked out while the files stream in batches into compact columns:
+    the raw lines are never all in memory at once. Dedup then keeps each
+    event_id's earliest copy, valid or not, and only then are invalid copies
+    dropped, so dedup still comes before validation, as the rules say.
     """
-    events = (
+    event_type = pl.col("event_type")
+    is_purchase = event_type == "purchase"
+    price = pl.col("price_cents")
+    ts_ms, ingest_ms, price_value = pl.col("ts_ms"), pl.col("ingest_ms"), pl.col("price_value")
+    copies = (
         split_fields(read_lines(csv_files(os.path.join(data_dir, "events"))), EVENT_COLS)
         .filter(pl.col("event_id").is_not_null())
-        .with_columns(pl.col("ingest_ts").pipe(parse_ts).alias("ingest_ms"))
+        .with_columns(
+            pl.col("ts").pipe(parse_ts).alias("ts_ms"),
+            pl.col("ingest_ts").pipe(parse_ts).alias("ingest_ms"),
+            pl.when(price.str.contains(DIGITS_RE)).then(digits_value(price, 8)).alias("price_value"),
+        )
+        .select(
+            "event_id", "user_id", ts_ms.alias("ts"), "ingest_ms",
+            pl.when(event_type.is_in(EVENT_TYPES)).then(event_type).cast(EVENT_TYPE).alias("event_type"),
+            "product_id",
+            pl.when(is_purchase).then(price_value).otherwise(0).alias("price_cents"),
+            (   # rules 3-4 for this copy
+                pl.col("user_id").is_not_null()
+                & ts_ms.is_between(start, end, closed="left")
+                & event_type.is_in(EVENT_TYPES)
+                & pl.col("product_id").is_not_null()
+                & (~is_purchase | price_value.is_between(1, MAX_PRICE))
+                & (ingest_ms - ts_ms <= DAY_MS)  # late: strictly over 24 h
+            ).fill_null(False).alias("ok"),
+        )
+        .collect(engine="streaming")
     )
     # Dedup before validation: keep the copy with the smallest ingest_ts.
     # Copies with equal ingest_ts are identical, so any one of them will do.
-    events = (
-        events.filter(pl.col("ingest_ms") == pl.col("ingest_ms").min().over("event_id"))
-        .unique(subset="event_id", keep="any")
-    )
-    is_purchase = pl.col("event_type") == "purchase"
-    price = pl.col("price_cents")
-    price_value = pl.when(price.str.contains(DIGITS_RE)).then(digits_value(price, 8))
-    events = events.with_columns(
-        pl.col("ts").pipe(parse_ts).alias("ts_ms"),
-        pl.when(is_purchase).then(price_value).otherwise(0).alias("price_value"),
-    )
+    # Most event_ids occur once and pass straight through; only the duplicated
+    # ones are sorted by ingest_ts to keep the first (far less memory and time
+    # than a min-over-event_id window on every row).
+    duplicated = copies.get_column("event_id").is_duplicated()
+    earliest = copies.filter(duplicated).sort("ingest_ms").unique(subset="event_id", keep="first")
     return (
-        events.filter(
-            pl.col("user_id").is_not_null()
-            & pl.col("ts_ms").is_between(start, end, closed="left")
-            & pl.col("event_type").is_in(EVENT_TYPES)
-            & pl.col("product_id").is_not_null()
-            & (~is_purchase | pl.col("price_value").is_between(1, MAX_PRICE))
-            & (pl.col("ingest_ms") - pl.col("ts_ms") <= DAY_MS)  # late: strictly over 24 h
-        )
-        .select("event_id", "user_id", pl.col("ts_ms").alias("ts"), "event_type", "product_id",
-                pl.col("price_value").alias("price_cents"))
+        pl.concat([copies.filter(~duplicated), earliest]).lazy()
+        .filter(pl.col("ok"))
+        .drop("ingest_ms", "ok")
     )
 
 
@@ -294,8 +311,14 @@ def sessionize(events):
     new_session = ((person != person.shift(1)) | (ts - ts.shift(1) > SESSION_GAP_MS)).fill_null(True)
     return (
         events.sort("person", "ts")
-        .with_columns(new_session.cum_sum().alias("session"))
-        .with_columns(ts.min().over("session").alias("start"))
+        .with_columns(new_session.alias("new_session"))
+        .with_columns(
+            pl.col("new_session").cum_sum().alias("session"),
+            # In ts order a session's first row is its start: carry it down the rows
+            # (cheaper than a min over each session).
+            pl.when(pl.col("new_session")).then(ts).forward_fill().alias("start"),
+        )
+        .drop("new_session")
         .with_columns(utc_date(pl.col("start")).alias("day"))  # rule 6: the start's UTC date
     )
 
@@ -461,13 +484,18 @@ def main():
     products = read_table(os.path.join(DATA, "products.csv"), PRODUCT_COLS)
     campaigns = read_table(os.path.join(DATA, "campaigns.csv"), CAMPAIGN_COLS)
     names = person_names(clean_links(DATA))
-    events = with_person(clean_events(DATA, start, end), names)
-    clicks = with_person(clean_clicks(DATA, start, end, campaigns), names).collect()
 
+    # Events first, and each big table is dropped as soon as it is used, so the
+    # event and click work never hold their large tables at the same time.
+    # event_id is only needed for dedup, so it goes right after.
+    events = with_person(clean_events(DATA, start, end).drop("event_id"), names)
     sessionized = sessionize(events).collect()
+    del events
     sessions = session_table(sessionized.lazy()).collect()
     write_table(user_daily(sessionized.lazy(), sessions.lazy(), products).collect(), "user_daily", USER_DAILY)
+    del sessionized
 
+    clicks = with_person(clean_clicks(DATA, start, end, campaigns), names).collect()
     credited = credit(sessions, clicks)
     write_table(campaign_daily(credited, assists(sessions, clicks), campaigns), "campaign_daily", CAMPAIGN_DAILY)
     print("wrote user_daily and campaign_daily")

@@ -13,6 +13,23 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Memory: compact event copies, cheaper dedup, free tables early
+- **Context:** The final uses ~60M events in 24 GB with no swap, and practice runs (~20M) can't show that. Peak memory footprint grew ~0.5 GB per 1M events (1M→3M, macOS), which projects to ~30 GB at 60M: out of memory, so no score
+- **Options:** A) Measure each stage and fix the biggest costs in place. B) Use integer codes for persons and campaigns throughout. C) Spill to `/scratch`
+- **Chose:** A. It is the smallest change that fixes the measured costs:
+  - Each event copy's values and validity are computed in one streamed pass into compact columns
+  - Dedup splits off the duplicated `event_id`s and sorts only those, instead of a min over every `event_id`. At 3M: +0.16 GB vs +0.77 GB, 0.30 s vs 0.69 s; options B–E were also measured
+  - `event_id` is dropped after dedup, and the events tables are freed before the click work starts
+  - A session's start is carried down with `forward_fill` instead of a min over each session
+- **Pros:**
+  - Footprint at 1M 1.01 → 0.67 GB, at 3M 2.02 → 1.20 GB. Growth is ~0.27 GB per 1M events, about 16–17 GB at 60M
+  - Docker dev run 4.6 → 2.3 s
+- **Cons / risks:**
+  - Still a projection from 3M on macOS, not a 60M measurement
+  - Several small changes go in one submission, all aimed at memory
+  - B is left in reserve. The assist join of runs × person-days (~1.25 rows per event) is the next-biggest cost
+- **Result:** — (attempt #2 pending)
+
 ## Assists: count per day, don't list pairs
 - **Context:** The dev set has 181,032 sessions but 1,958,238 (session, campaign) assist pairs. At 60× the data that is likely over 100M pairs, more for whales, so listing pairs is too costly
 - **Options:** A) Per (person, campaign), merge the clicks' 7-day spans into disjoint runs. Cut each run by day, keeping only days with sessions, then count sessions per piece from a running count (`join_asof`). B) Join each session with the person's clicks in its 7 days and list distinct campaigns
