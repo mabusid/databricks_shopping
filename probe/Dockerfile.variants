@@ -12,6 +12,7 @@ RUN mkdir /bin-out && T=x86_64-unknown-linux-gnu && first=1 && for v in $(ls /va
       if [ -f /variants/$v/base ]; then cargo build --release --locked --offline --bin shopping && cp target/release/shopping /bin-out/$v-base; fi && \
       if [ "$(uname -m)" = x86_64 ]; then \
         RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked --offline --bin shopping --target $T --target-dir /t3 && cp /t3/$T/release/shopping /bin-out/$v-v3 && \
+        if [ -f /variants/$v/v4 ]; then RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release --locked --offline --bin shopping --target $T --target-dir /t4 && cp /t4/$T/release/shopping /bin-out/$v-v4; fi && \
         if [ $first = 1 ]; then \
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release --locked --offline --bin shopping --target $T --target-dir /t3 --no-run 2>&1 | tee /tmp/t.log && \
           cp "$(sed -n 's/.*(\(\/t3\/[^)]*\)).*/\1/p' /tmp/t.log | head -1)" /bin-out/tests-v3; fi; \
