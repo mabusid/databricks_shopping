@@ -135,6 +135,64 @@ fn eq_mask(w: u64, b: u8) -> u64 {
     !(((x & LOW7).wrapping_add(LOW7)) | x | LOW7)
 }
 
+/// Bitmasks, one bit per byte, of the commas, quotes and newlines in a 64-byte
+/// block (simdjson's "stage 1"). SSE2 on x86-64 (every x86-64 CPU has it),
+/// NEON on arm64, plain 8-byte words elsewhere.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: SSE2 is part of the x86-64 baseline; loads are unaligned and in bounds.
+    unsafe {
+        let (comma, quote, newline) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8), _mm_set1_epi8(b'\n' as i8));
+        let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+        for k in 0..4 {
+            let v = _mm_loadu_si128(b.as_ptr().add(16 * k) as *const __m128i);
+            c |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, comma)) as u32 as u64) << (16 * k);
+            q |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, quote)) as u32 as u64) << (16 * k);
+            n |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, newline)) as u32 as u64) << (16 * k);
+        }
+        (c, q, n)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is part of the arm64 baseline; loads are in bounds.
+    unsafe {
+        const BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bit = vld1q_u8(BIT.as_ptr());
+        let v = [vld1q_u8(b.as_ptr()), vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)), vld1q_u8(b.as_ptr().add(48))];
+        // Compare, keep one distinct bit per byte, then add neighbouring bytes
+        // three times: byte j of the result is the mask of bytes 8j..8j+8.
+        let mask = |x: u8| -> u64 {
+            let x = vdupq_n_u8(x);
+            let t = [vandq_u8(vceqq_u8(v[0], x), bit), vandq_u8(vceqq_u8(v[1], x), bit),
+                     vandq_u8(vceqq_u8(v[2], x), bit), vandq_u8(vceqq_u8(v[3], x), bit)];
+            let s = vpaddq_u8(vpaddq_u8(t[0], t[1]), vpaddq_u8(t[2], t[3]));
+            vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(s, s)), 0)
+        };
+        (mask(b','), mask(b'"'), mask(b'\n'))
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
+    let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+    for k in 0..8 {
+        let w = u64::from_le_bytes(b[8 * k..8 * k + 8].try_into().unwrap());
+        // 0x80 per matching byte -> one bit per byte.
+        let squash = |m: u64| ((m >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u64;
+        c |= squash(eq_mask(w, b',')) << (8 * k);
+        q |= squash(eq_mask(w, b'"')) << (8 * k);
+        n |= squash(eq_mask(w, b'\n')) << (8 * k);
+    }
+    (c, q, n)
+}
+
 /// Call `f(fields)` for every line of `chunk`: Some if the line has exactly N
 /// fields, each fully quoted or quote-free (quotes removed), None if it is
 /// malformed. Same rules as `fields::<N>(line)`.
@@ -189,6 +247,31 @@ pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(O
     }
 
     let mut i = 0;
+    // 64 bytes at a time with SIMD; the rest 8 bytes at a time, then byte by byte.
+    while i + 64 <= n {
+        let (mut c, mut q, mut nl) = masks64(chunk[i..i + 64].try_into().unwrap());
+        while nl != 0 {
+            // Everything before this newline belongs to the current line.
+            let k = nl.trailing_zeros();
+            let below = (1u64 << k) - 1;
+            let mut cb = c & below;
+            while cb != 0 {
+                comma!(i + cb.trailing_zeros() as usize);
+                cb &= cb - 1;
+            }
+            quotes += (q & below).count_ones();
+            c &= !below;
+            q &= !below;
+            end_line!(i + k as usize);
+            nl &= nl - 1;
+        }
+        while c != 0 {
+            comma!(i + c.trailing_zeros() as usize);
+            c &= c - 1;
+        }
+        quotes += q.count_ones();
+        i += 64;
+    }
     while i + 8 <= n {
         let w = u64::from_le_bytes(chunk[i..i + 8].try_into().unwrap());
         let mut c = eq_mask(w, b',');
@@ -274,8 +357,8 @@ mod tests {
         // Random chunks over a small alphabet that hits every case.
         let alphabet = b"ab,\"\n \r";
         let mut x: u64 = 0x2545_f491_4f6c_dd1d;
-        for _ in 0..20_000 {
-            let len = (x % 90) as usize;
+        for _ in 0..50_000 {
+            let len = (x % 300) as usize;
             let mut buf = Vec::with_capacity(len);
             for _ in 0..len {
                 x ^= x << 13;

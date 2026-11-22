@@ -23,7 +23,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Neutral on the M1 (the table fits its 12 MB L2), so the gain is a scorer-only theory
   - Linked IDs pay one extra cache-line read
   - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
-- **Result:** — (attempt #10 pending)
+- **Result:** Attempt #10: 2.8037 → 2.6968 s. Memory latency matters on the scorer
 
 ## Linked IDs built in parallel
 - **Context:** The linked-ID stage ran on one thread while the other 7 waited. At 3M it took ~21 ms (parse 2.6 ms, interning + union 10.7 ms, names + table 8.2 ms), so probably ~0.15 s locally at 20M and more on the scorer

@@ -20,3 +20,4 @@ Reference (track page, scorer version shopping-sessions-5): baseline 167.6152 s 
 | 7 | 2026-11-22 after 00:02 EST | `9260d86` | 128-bit person identity (no name reads in hot paths) | 36/36 | ~0.242 (3M, Mac) | 3.2035 | 8.7% faster than #6 (3.5092); best so far. Still with 2048 buckets at 20M |
 | 8 | 2026-11-22 after 00:08 EST | `cefd089` | Back to 256 buckets (keeps per-thread lists and quote-counting scanner) | 36/36 | ~0.24 (3M, Mac) | 3.0086 | 6% faster than #7 (3.2035); best so far. Confirms 2048 buckets hurt |
 | 9 | 2026-11-22 after 00:17 EST | `8d57ae9` | Linked-ID table built in parallel (lock-free union-find) | 36/36 | ~0.23 (3M, Mac) | 2.8037 | 6.8% faster than #8 (3.0086); best so far |
+| 10 | 2026-11-22 after 01:11 EST | `7512355` | Bloom filter in front of the linked-ID table | 36/36 | ~0.23 (3M, Mac; neutral there) | 2.6968 | 3.8% faster than #9 (2.8037); best so far. Memory latency matters on the scorer |
