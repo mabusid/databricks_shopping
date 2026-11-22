@@ -203,7 +203,7 @@ struct UserRow {
 
 /// Events rules 1 and 3-4 for one well-formed line's fields: None if the event_id is empty.
 #[inline]
-fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
+fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
     let (start, end) = (lk.start, lk.end);
     let [event_id, user_id, ts, ingest, event_type, product_id, price] = fields;
     if event_id.is_empty() {
@@ -228,29 +228,124 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
         && !product_id.is_empty()
         && price.is_some()
         && ingest - ts <= DAY; // late: strictly over 24 h (ts is in the window here, so no overflow)
-    let (person, key, category) = if ok {
-        let (person, key) = lk.links.person_of(user_id);
+    // The person is filled in later (`finish_event`), once its table slot has had
+    // time to arrive in cache: here only the key is computed and the slot prefetched.
+    let (key, maybe_linked, category) = if ok {
+        let key = key_of(user_id);
+        let maybe = lk.links.prefetch(key);
         let category = if event_type == PURCHASE {
             lk.product_category.get(product_id).copied().unwrap_or(lk.unknown)
         } else {
             0
         };
-        (person, key, category)
+        (key, maybe, category)
     } else {
-        (&[][..], (0, 0), 0)
+        (NO_KEY, false, 0)
     };
-    Some(EventCopy {
-        h: hash(event_id), event_id: PStr::new(event_id), person: PStr::new(person), key, ts, ingest,
-        price: price.unwrap_or(0) as i32, category, event_type, ok,
+    Some(Pending {
+        copy: EventCopy {
+            h: hash(event_id), event_id: PStr::new(event_id), person: PStr(0), key, ts, ingest,
+            price: price.unwrap_or(0) as i32, category, event_type, ok,
+        },
+        user_id,
+        maybe_linked,
     })
 }
 
-/// One linked ID: its key, and its person's name and key, all in the table
-/// entry so a lookup is one memory access.
-struct LinkEntry {
-    id: PersonKey,
-    name: Str,
+/// A parsed copy waiting for its person (see `parse_event`).
+#[derive(Clone, Copy)]
+struct Pending {
+    copy: EventCopy,
+    user_id: Str,
+    maybe_linked: bool,
+}
+
+#[inline]
+fn finish_event(p: Pending, links: &Links) -> EventCopy {
+    let mut c = p.copy;
+    if c.ok {
+        let (person, key) = links.resolve(p.user_id, c.key, p.maybe_linked);
+        c.person = PStr::new(person);
+        c.key = key;
+    }
+    c
+}
+
+/// How many parsed copies wait before their person is looked up: enough lines
+/// for a prefetched table slot to arrive from memory.
+const PIPELINE: usize = 8;
+
+/// One linked ID: its key, and its person's name and key, all in one 40-byte
+/// slot so a lookup is one (prefetchable) memory access.
+#[derive(Clone, Copy)]
+struct LinkSlot {
+    id: PersonKey, // (0, 0) marks an empty slot; a real (0, 0) key is kept apart
     person: PersonKey,
+    name: PStr,
+}
+
+const NO_KEY: PersonKey = (0, 0);
+
+/// One part's table: open addressing, linear probing, at most half full.
+struct LinkPart {
+    slots: Vec<LinkSlot>,
+    mask: usize,
+}
+
+impl LinkPart {
+    fn build(entries: &[LinkSlot]) -> LinkPart {
+        let cap = (entries.len() * 2).max(16).next_power_of_two();
+        let mut slots = vec![LinkSlot { id: NO_KEY, person: NO_KEY, name: PStr(0) }; cap];
+        for e in entries {
+            let mut i = e.id.0 as usize & (cap - 1);
+            while slots[i].id != NO_KEY {
+                i = (i + 1) & (cap - 1);
+            }
+            slots[i] = *e;
+        }
+        LinkPart { slots, mask: cap - 1 }
+    }
+
+    #[inline]
+    fn home(&self, key: PersonKey) -> *const LinkSlot {
+        &self.slots[key.0 as usize & self.mask]
+    }
+
+    #[inline]
+    fn find(&self, key: PersonKey) -> Option<&LinkSlot> {
+        let mut i = key.0 as usize & self.mask;
+        loop {
+            let s = &self.slots[i];
+            if s.id == key {
+                return Some(s);
+            }
+            if s.id == NO_KEY {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// Ask the CPU to start loading the cache lines of `*p` (never faults).
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    let end = (p as usize + std::mem::size_of::<T>() - 1) as *const u8;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint; it never faults and never changes memory.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+        _mm_prefetch(end as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", "prfm pldl1keep, [{1}]", in(reg) p, in(reg) end,
+                        options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = end;
 }
 
 /// The linked IDs are split into this many parts by key, so building them runs in parallel.
@@ -262,7 +357,9 @@ fn link_part(key: PersonKey) -> usize {
 }
 
 struct Links {
-    parts: Vec<HashTable<LinkEntry>>,
+    parts: Vec<LinkPart>,
+    /// The person of a linked ID whose key is (0, 0), if there is one.
+    zero: Option<(PStr, PersonKey)>,
     /// A Bloom filter of every linked ID's key: 8+ bits per ID, 2 bits set each.
     /// A clear bit means "in no link" for sure, so most one-ID people skip the
     /// big table (which at 20M is far larger than a Xeon core's cache).
@@ -290,11 +387,31 @@ impl Links {
     #[inline]
     fn person_of(&self, id: Str) -> (Str, PersonKey) {
         let key = key_of(id);
-        if !self.maybe_linked(key) {
+        let maybe = self.maybe_linked(key);
+        self.resolve(id, key, maybe)
+    }
+
+    /// Start loading the table slot a key will need (when the Bloom filter says
+    /// it may be linked); returns that answer for `resolve`.
+    #[inline]
+    fn prefetch(&self, key: PersonKey) -> bool {
+        let maybe = self.maybe_linked(key);
+        if maybe {
+            prefetch(self.parts[link_part(key)].home(key));
+        }
+        maybe
+    }
+
+    #[inline]
+    fn resolve(&self, id: Str, key: PersonKey, maybe_linked: bool) -> (Str, PersonKey) {
+        if !maybe_linked {
             return (id, key);
         }
-        match self.parts[link_part(key)].find(key.0, |e| e.id == key) {
-            Some(e) => (e.name, e.person),
+        if key == NO_KEY {
+            return self.zero.map_or((id, key), |(n, k)| (n.get(), k));
+        }
+        match self.parts[link_part(key)].find(key) {
+            Some(e) => (e.name.get(), e.person),
             None => (id, key),
         }
     }
@@ -424,22 +541,27 @@ fn person_names(links_dir: &Path) -> Links {
     });
 
     // 4. The lookup tables.
-    let parts: Vec<HashTable<LinkEntry>> = (0..LINK_PARTS)
+    let slots: Vec<Vec<LinkSlot>> = (0..LINK_PARTS)
         .into_par_iter()
         .map(|p| {
-            let keys = &numbered[p].0;
-            let mut table = HashTable::with_capacity(keys.len());
-            for (local, &k) in keys.iter().enumerate() {
+            numbered[p].0.iter().enumerate().map(|(local, &k)| {
                 let g = offset[p] as usize + local;
                 let name = ids[best[roots[g] as usize].load(Relaxed) as usize];
-                table.insert_unique(k.0, LinkEntry { id: k, name, person: key_of(name) }, |e: &LinkEntry| e.id.0);
-            }
-            table
+                LinkSlot { id: k, person: key_of(name), name: PStr::new(name) }
+            }).collect()
+        })
+        .collect();
+    let zero = slots.iter().flatten().find(|e| e.id == NO_KEY).map(|e| (e.name, e.person));
+    let parts: Vec<LinkPart> = slots
+        .par_iter()
+        .map(|entries| {
+            let real: Vec<LinkSlot> = entries.iter().filter(|e| e.id != NO_KEY).copied().collect();
+            LinkPart::build(&real)
         })
         .collect();
     // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
     let bits = (n * 8).max(1 << 16).next_power_of_two();
-    let mut links = Links { parts, bloom: vec![0u64; bits / 64], bloom_mask: (bits / 512 - 1) as u64 };
+    let mut links = Links { parts, zero, bloom: vec![0u64; bits / 64], bloom_mask: (bits / 512 - 1) as u64 };
     for p in 0..LINK_PARTS {
         for &k in &numbered[p].0 {
             let (a, b) = links.bloom_bits(k);
@@ -779,11 +901,23 @@ fn run() {
     let copies: Vec<Vec<BlockList<EventCopy>>> = per_thread(threads, new_lists::<EventCopy>, |acc| {
         event_chunks.par_iter().for_each(|&chunk| {
             let mut b = acc();
+            let mut ring: [Option<Pending>; PIPELINE] = [None; PIPELINE];
+            let mut at = 0;
             input::for_each_record::<7>(chunk, |rec| {
-                if let Some(c) = rec.and_then(|f| parse_event(f, &lookups)) {
-                    b[bucket(c.h)].push(c);
+                if let Some(p) = rec.and_then(|f| parse_event(f, &lookups)) {
+                    if let Some(old) = ring[at].replace(p) {
+                        let c = finish_event(old, &links);
+                        b[bucket(c.h)].push(c);
+                    }
+                    at = (at + 1) % PIPELINE;
                 }
             });
+            for k in 0..PIPELINE {
+                if let Some(old) = ring[(at + k) % PIPELINE].take() {
+                    let c = finish_event(old, &links);
+                    b[bucket(c.h)].push(c);
+                }
+            }
         });
     });
     log("events parsed");

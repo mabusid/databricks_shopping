@@ -13,6 +13,18 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Person lookups: flat link table, prefetched 8 lines ahead
+- **Context:** In the parse-pass split, the person lookup added 0.030 s at 2M (~57 ns a line), mostly waiting on memory for the table probe. At 20M the linked-ID table is ~10× bigger than a Xeon core's cache
+- **Options:** A) Our own open-addressing table (40-byte slots holding the ID key, person key and packed name; linear probing, at most half full; one table per part, built in parallel), plus a software pipeline: each parsed copy computes its key, checks the Bloom filter and prefetches its slot, then waits in an 8-slot ring; its person is filled in when it leaves. B) Keep hashbrown (its slots can't be prefetched from outside)
+- **Chose:** A. A real (0, 0) key, practically impossible, is kept in its own field, so the empty-slot marker never makes a result wrong. Prefetch is SSE `_mm_prefetch` on x86-64 and `prfm` on arm64
+- **Pros:**
+  - Linux proxy (2M, 16 interleaved runs vs #15): best 0.207 → 0.203 s, p25 0.231 → 0.219 s, median 0.239 → 0.232 s
+  - Likely more on the scorer, where the table doesn't fit in cache
+- **Cons / risks:**
+  - Records leave the parse in a slightly different order, which doesn't matter: dedup keeps the smallest ingest_ts, and tied copies are identical
+  - Checks: unit tests, 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
+- **Result:** — (attempt #16 pending)
+
 ## Compact records: 8-byte string slices
 - **Context:** The parse-pass split (Linux, 2M) still put the biggest cost on writing records into fresh memory: + 0.09–0.13 s for fresh block lists against + 0.03–0.04 s reused. That cost scales with the bytes written
 - **Options:** A) Pack each string slice into 8 bytes (48-bit address, 16-bit length), so copy 80 → 64 B, event 48 → 40 B, click 48 → 40 B. B) Also shrink timestamps to u32 offsets (more code, ~4 more bytes)
@@ -22,7 +34,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Relies on 48-bit user-space addresses (true for x86-64 4-level paging and arm64 Linux), with the side table as a safe fallback
   - Checks: unit tests, 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
-- **Result:** — (attempt #15 pending)
+- **Result:** Attempt #15: 2.2333 → 2.1554 s
 
 ## Parse: branchless field quotes, one-check timestamps, XXH3-128 person keys
 - **Context:** A line-level Linux profile of #13 put 14% of the whole run on one line: the per-field check of whether a field is wrapped in quotes (`quotes != 0 && e - s >= 2 && chunk[s] == '"' && chunk[e-1] == '"'`). ~20% of fields are quoted at random, so the branch mispredicts about once per line. Timestamps were ~10%
