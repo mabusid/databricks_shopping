@@ -48,8 +48,24 @@ pub fn init(bytes: usize) {
         let advice = if std::env::var("SHOPPING_THP").is_ok_and(|v| v == "0") { libc::MADV_NOHUGEPAGE } else { libc::MADV_HUGEPAGE };
         libc::madvise(base as *mut libc::c_void, bytes, advice);
     }
+    POPULATE.store(std::env::var("SHOPPING_POPULATE").is_ok_and(|v| v == "1") as usize, Relaxed);
     ARENA_BYTES.store(bytes, Relaxed);
     BASE.store(base, Relaxed);
+}
+
+static POPULATE: AtomicUsize = AtomicUsize::new(0);
+
+/// SHOPPING_POPULATE=1 (probes): map each new chunk's pages with one call
+/// (MADV_POPULATE_WRITE, Linux 5.14+) instead of one page fault per page.
+#[inline]
+fn populate(addr: usize, len: usize) {
+    #[cfg(target_os = "linux")]
+    if POPULATE.load(Relaxed) == 1 {
+        const MADV_POPULATE_WRITE: i32 = 23;
+        // SAFETY: the range lies inside the arena; on error (old kernel) the pages just fault later.
+        unsafe { libc::madvise(addr as *mut libc::c_void, len, MADV_POPULATE_WRITE) };
+    }
+    let _ = (addr, len);
 }
 
 thread_local! {
@@ -66,6 +82,7 @@ fn take_block() -> *mut u8 {
             assert!(off + CHUNK_BYTES <= ARENA_BYTES.load(Relaxed), "arena full");
             next = BASE.load(Relaxed) + off;
             end = next + CHUNK_BYTES;
+            populate(next, CHUNK_BYTES);
         }
         c.set((next + BLOCK_BYTES, end));
         next as *mut u8
