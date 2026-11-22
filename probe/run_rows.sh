@@ -97,6 +97,6 @@ if awk "BEGIN{exit !($(el) < 125)}" && [ -d "$S/g20" -o -d /data/events ]; then
   SHOPPING_PROBE="${MICRO_DIR:-/data}" timeout 25 /app/writer > "$S/micro.log" 2>&1
   micro=$(grep '^probe' "$S/micro.log" | sed -e 's/^probe //' -e 's/  */ /g' -e 's/ GB\/s/GB\/s/g' -e 's/ ns\/load/ns/g' -e 's/ ([0-9]*)//' | grep -v '^cpu ' | tr '\n' ';')
 fi
-sed -i "s|^u\tu4 60M\(.*\)\tu4b\$|u\tu4 60M\1\tu4b $micro (at $(el)s)|" "$SUM"
+sed -i "s|^u\tu4 60M\(.*\)\tu4b *$|u\tu4 60M\1\tu4b $micro (at $(el)s)|" "$SUM"
 rm -rf "$S/g20" "$S/o"
 finish
