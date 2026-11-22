@@ -7,6 +7,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::{create_dir_all, File};
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +38,8 @@ pub fn write_table(out: &Path, table: &str, part: usize, schema: &str, columns: 
             .set_statistics_enabled(EnabledStatistics::None) // min/max nobody reads
             .build(),
     );
-    let file = File::create(folder.join(format!("part-{part}.parquet"))).expect("create parquet file");
+    // Buffered: the Parquet writer makes many small writes.
+    let file = BufWriter::with_capacity(8 << 20, File::create(folder.join(format!("part-{part}.parquet"))).expect("create parquet file"));
     let mut writer = SerializedFileWriter::new(file, schema, props).expect("parquet writer");
     let mut group = writer.next_row_group().expect("row group");
     for column in columns {
@@ -61,7 +63,8 @@ pub fn write_table(out: &Path, table: &str, part: usize, schema: &str, columns: 
         col.close().expect("close column");
     }
     group.close().expect("close row group");
-    writer.close().expect("close parquet file");
+    // into_inner writes the footer; the BufWriter's into_inner flushes it, failing loudly on error.
+    writer.into_inner().expect("write parquet footer").into_inner().expect("flush parquet file");
 }
 
 pub const USER_DAILY: &str = "message user_daily {

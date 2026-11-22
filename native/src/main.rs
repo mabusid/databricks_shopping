@@ -29,7 +29,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 30 * 60 * 1000;
 const BUCKETS: usize = 256;
-const CHUNK_BYTES: usize = 16 << 20;
+const CHUNK_BYTES: usize = 2 << 20;
 
 const VIEW: u8 = 0;
 const CART: u8 = 1;
@@ -120,11 +120,11 @@ struct UserRow {
     top: Option<u16>,
 }
 
-/// Events rules 1 and 3-4 for one line: None if malformed or the event_id is empty.
+/// Events rules 1 and 3-4 for one well-formed line's fields: None if the event_id is empty.
 #[inline]
-fn parse_event(line: Str, lk: &Lookups) -> Option<EventCopy> {
+fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
     let (start, end) = (lk.start, lk.end);
-    let [event_id, user_id, ts, ingest, event_type, product_id, price] = input::fields::<7>(line)?;
+    let [event_id, user_id, ts, ingest, event_type, product_id, price] = fields;
     if event_id.is_empty() {
         return None;
     }
@@ -190,8 +190,8 @@ fn person_names(links_dir: &Path) -> Links {
         .par_iter()
         .flat_map_iter(|&chunk| {
             let mut pairs = Vec::new();
-            input::for_each_line(chunk, |line| {
-                if let Some([a, b]) = input::fields::<2>(line) {
+            input::for_each_record::<2>(chunk, |rec| {
+                if let Some([a, b]) = rec {
                     if !a.is_empty() && !b.is_empty() {
                         pairs.push((a, b));
                     }
@@ -302,63 +302,90 @@ struct Context {
 }
 
 /// Events rules 5-7 and clicks rules 4-7 for the people of one bucket.
-fn person_bucket(events: Vec<&Event>, clicks: Vec<&Click>, cx: &Context, tally: &mut Tally) {
-    // Number the bucket's people (by their stored hash), then sort events by (person, ts).
-    let mut number: HashTable<(u64, u32)> = HashTable::with_capacity(events.len() / 4 + 16);
+///
+/// People are numbered (exact name comparison), then events and clicks are
+/// placed person by person with a counting sort (two linear passes), so the
+/// only sorting left is by time within each person.
+fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usize, cx: &Context, tally: &mut Tally) {
+    let n_events: usize = events.iter().map(|e| e[bi].len()).sum();
+    let mut number: HashTable<(u64, u32)> = HashTable::with_capacity(n_events / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
-    let mut evs: Vec<(u32, i64, i32, u16, u8)> = events
-        .iter()
-        .map(|e| {
-            let id = match number.entry(e.hp, |&(h, i)| h == e.hp && same(names[i as usize], e.person), |x| x.0) {
-                hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
-                hashbrown::hash_table::Entry::Vacant(v) => {
-                    v.insert((e.hp, names.len() as u32));
-                    names.push(e.person);
-                    (names.len() - 1) as u32
-                }
-            };
-            (id, e.ts, e.price, e.category, e.event_type)
-        })
-        .collect();
-    evs.sort_unstable_by_key(|e| (e.0, e.1));
-    // Clicks of people with events, by (person, ts, click_id) for credit and (person, campaign, ts) for assists.
-    let mut cks: Vec<(u32, i64, Str, u32)> = clicks
-        .iter()
-        .filter_map(|c| {
-            number
-                .find(c.hp, |&(h, i)| h == c.hp && same(names[i as usize], c.person))
-                .map(|&(_, id)| (id, c.ts, c.click_id, c.campaign))
-        })
-        .collect();
-    cks.sort_unstable();
-    let mut runs: Vec<(u32, u32, i64)> = cks.iter().map(|c| (c.0, c.3, c.1)).collect();
-    runs.sort_unstable();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut ids: Vec<u32> = Vec::with_capacity(n_events);
+    for e in events.iter().flat_map(|e| &e[bi]) {
+        let id = match number.entry(e.hp, |&(h, i)| h == e.hp && same(names[i as usize], e.person), |x| x.0) {
+            hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
+            hashbrown::hash_table::Entry::Vacant(v) => {
+                v.insert((e.hp, names.len() as u32));
+                names.push(e.person);
+                counts.push(0);
+                (names.len() - 1) as u32
+            }
+        };
+        counts[id as usize] += 1;
+        ids.push(id);
+    }
+    let people = names.len();
+    // Counting sort of events by person: (ts, price, category, event_type).
+    let mut ev_at = vec![0u32; people + 1];
+    for p in 0..people {
+        ev_at[p + 1] = ev_at[p] + counts[p];
+    }
+    let mut fill: Vec<u32> = ev_at[..people].to_vec();
+    let mut evs: Vec<(i64, i32, u16, u8)> = vec![(0, 0, 0, 0); n_events];
+    for (e, &id) in events.iter().flat_map(|e| &e[bi]).zip(&ids) {
+        let at = &mut fill[id as usize];
+        evs[*at as usize] = (e.ts, e.price, e.category, e.event_type);
+        *at += 1;
+    }
+    drop(ids);
+    // Clicks of people with events, the same way: (ts, click_id, campaign).
+    let mut click_ids: Vec<(u32, u32)> = Vec::new(); // (person, index into the flat click list)
+    let flat_clicks: Vec<&Click> = clicks.iter().flat_map(|c| &c[bi]).collect();
+    let mut ck_count = vec![0u32; people];
+    for (k, c) in flat_clicks.iter().enumerate() {
+        if let Some(&(_, id)) = number.find(c.hp, |&(h, i)| h == c.hp && same(names[i as usize], c.person)) {
+            ck_count[id as usize] += 1;
+            click_ids.push((id, k as u32));
+        }
+    }
+    let mut ck_at = vec![0u32; people + 1];
+    for p in 0..people {
+        ck_at[p + 1] = ck_at[p] + ck_count[p];
+    }
+    let mut fill: Vec<u32> = ck_at[..people].to_vec();
+    let mut cks: Vec<(i64, Str, u32)> = vec![(0, &[][..], 0); click_ids.len()];
+    for &(id, k) in &click_ids {
+        let c = flat_clicks[k as usize];
+        let at = &mut fill[id as usize];
+        cks[*at as usize] = (c.ts, c.click_id, c.campaign);
+        *at += 1;
+    }
+    drop(click_ids);
 
     let organic = cx.campaigns;
-    let (mut ci, mut ri) = (0usize, 0usize);
     let mut sessions: Vec<Session> = Vec::new();
+    let mut runs: Vec<(u32, i64)> = Vec::new();
+    let mut starts: Vec<i64> = Vec::new();
+    let mut day_end: Vec<usize> = Vec::new();
     let mut spend = vec![0i64; cx.categories];
-    let mut i = 0;
-    while i < evs.len() {
-        let person = evs[i].0;
-        let mut j = i;
-        while j < evs.len() && evs[j].0 == person {
-            j += 1;
-        }
+    for p in 0..people {
+        let evs = &mut evs[ev_at[p] as usize..ev_at[p + 1] as usize];
+        evs.sort_unstable_by_key(|e| e.0);
         // Rule 5: a new session where the gap from the previous event is over 30 min.
         // Equal timestamps have a gap of 0, so they always share a session.
         sessions.clear();
         let mut prev = i64::MIN;
         let mut row: Option<UserRow> = None;
-        for e in &evs[i..j] {
-            let (ts, price, category, event_type) = (e.1, e.2 as i64, e.3, e.4);
+        for &(ts, price, category, event_type) in evs.iter() {
+            let price = price as i64;
             if sessions.is_empty() || ts - prev > SESSION_GAP {
                 let day = (ts.div_euclid(DAY) - cx.base_day) as usize; // rule 6: the start's UTC date
                 if row.as_ref().is_some_and(|r| r.day as i64 != cx.base_day + day as i64) {
                     tally.users.push(finish_row(row.take().unwrap(), &mut spend, cx));
                 }
                 let r = row.get_or_insert(UserRow {
-                    person: names[person as usize],
+                    person: names[p],
                     day: (cx.base_day + day as i64) as i32,
                     sessions: 0,
                     events: 0,
@@ -381,38 +408,33 @@ fn person_bucket(events: Vec<&Event>, clicks: Vec<&Click>, cx: &Context, tally: 
         }
         tally.users.push(finish_row(row.take().unwrap(), &mut spend, cx));
 
-        // This person's clicks.
-        while ci < cks.len() && cks[ci].0 < person {
-            ci += 1;
+        let clicks = &mut cks[ck_at[p] as usize..ck_at[p + 1] as usize];
+        if clicks.is_empty() {
+            for s in &sessions {
+                let c = &mut tally.credited[organic * cx.days + s.day];
+                c[0] += 1;
+                c[1] += (s.purchases > 0) as i64;
+                c[2] += s.revenue;
+            }
+            continue;
         }
-        let mut ce = ci;
-        while ce < cks.len() && cks[ce].0 == person {
-            ce += 1;
-        }
-        let clicks = &cks[ci..ce];
-        while ri < runs.len() && runs[ri].0 < person {
-            ri += 1;
-        }
-        let mut re = ri;
-        while re < runs.len() && runs[re].0 == person {
-            re += 1;
-        }
+        clicks.sort_unstable(); // by (ts, click_id, campaign)
 
         // Rules 4-5: credit each session to the latest click with ts <= start and
         // start - ts <= 7 days; on a tie in ts, the smallest click_id; else organic.
         let mut k = 0;
         for s in &sessions {
-            while k < clicks.len() && clicks[k].1 <= s.start {
+            while k < clicks.len() && clicks[k].0 <= s.start {
                 k += 1;
             }
             let mut campaign = organic;
-            if k > 0 && s.start - clicks[k - 1].1 <= WEEK {
-                let t = clicks[k - 1].1;
+            if k > 0 && s.start - clicks[k - 1].0 <= WEEK {
+                let t = clicks[k - 1].0;
                 let mut g = k - 1;
-                while g > 0 && clicks[g - 1].1 == t {
+                while g > 0 && clicks[g - 1].0 == t {
                     g -= 1; // sorted by click_id within a ts: the first is the smallest
                 }
-                campaign = clicks[g].3 as usize;
+                campaign = clicks[g].2 as usize;
             }
             let c = &mut tally.credited[campaign * cx.days + s.day];
             c[0] += 1;
@@ -424,35 +446,37 @@ fn person_bucket(events: Vec<&Event>, clicks: Vec<&Click>, cx: &Context, tally: 
         // start - 7 days <= ts <= start, i.e. the start is in [ts, ts + 7 days].
         // Per campaign, merge those spans into disjoint runs, then count the
         // sessions in each run day by day (each counted once per campaign).
-        if re > ri {
-            let starts: Vec<i64> = sessions.iter().map(|s| s.start).collect();
-            let mut day_end = vec![0usize; sessions.len()]; // first index after this session's day
-            for x in (0..sessions.len()).rev() {
-                day_end[x] = if x + 1 < sessions.len() && sessions[x + 1].day == sessions[x].day { day_end[x + 1] } else { x + 1 };
-            }
-            let mut count_run = |campaign: u32, from: i64, last_click: i64| {
-                let to = last_click + WEEK;
-                let lo = starts.partition_point(|&x| x < from);
-                let hi = starts.partition_point(|&x| x <= to);
-                let mut x = lo;
-                while x < hi {
-                    let end = day_end[x].min(hi);
-                    tally.assisted[campaign as usize * cx.days + sessions[x].day] += (end - x) as i64;
-                    x = end;
-                }
-            };
-            let (mut campaign, mut from, mut last) = (runs[ri].1, runs[ri].2, runs[ri].2);
-            for &(_, c, ts) in &runs[ri + 1..re] {
-                if c == campaign && ts - last <= WEEK {
-                    last = ts;
-                } else {
-                    count_run(campaign, from, last);
-                    (campaign, from, last) = (c, ts, ts);
-                }
-            }
-            count_run(campaign, from, last);
+        runs.clear();
+        runs.extend(clicks.iter().map(|c| (c.2, c.0)));
+        runs.sort_unstable();
+        starts.clear();
+        starts.extend(sessions.iter().map(|s| s.start));
+        day_end.clear();
+        day_end.resize(sessions.len(), 0); // first index after this session's day
+        for x in (0..sessions.len()).rev() {
+            day_end[x] = if x + 1 < sessions.len() && sessions[x + 1].day == sessions[x].day { day_end[x + 1] } else { x + 1 };
         }
-        i = j;
+        let mut count_run = |campaign: u32, from: i64, last_click: i64| {
+            let to = last_click + WEEK;
+            let lo = starts.partition_point(|&x| x < from);
+            let hi = starts.partition_point(|&x| x <= to);
+            let mut x = lo;
+            while x < hi {
+                let end = day_end[x].min(hi);
+                tally.assisted[campaign as usize * cx.days + sessions[x].day] += (end - x) as i64;
+                x = end;
+            }
+        };
+        let (mut campaign, mut from, mut last) = (runs[0].0, runs[0].1, runs[0].1);
+        for &(c, ts) in &runs[1..] {
+            if c == campaign && ts - last <= WEEK {
+                last = ts;
+            } else {
+                count_run(campaign, from, last);
+                (campaign, from, last) = (c, ts, ts);
+            }
+        }
+        count_run(campaign, from, last);
     }
 }
 
@@ -530,8 +554,8 @@ fn run() {
         .par_iter()
         .map(|&chunk| {
             let mut b = new_buckets(chunk.len() / 70 / BUCKETS * 5 / 4 + 8);
-            input::for_each_line(chunk, |line| {
-                if let Some(c) = parse_event(line, &lookups) {
+            input::for_each_record::<7>(chunk, |rec| {
+                if let Some(c) = rec.and_then(|f| parse_event(f, &lookups)) {
                     b[bucket(c.h)].push(c);
                 }
             });
@@ -571,7 +595,8 @@ fn run() {
             b
         })
         .collect();
-    drop(copies);
+    // Big tables are never freed: freeing costs time (madvise/munmap) and the process ends soon.
+    std::mem::forget(copies);
     log("events deduped and validated");
 
     // Pass 3: clicks. Copies of a click are identical, so dedup can change
@@ -581,8 +606,8 @@ fn run() {
         .par_iter()
         .map(|&chunk| {
             let mut b = new_buckets(chunk.len() / 50 / BUCKETS * 5 / 4 + 8);
-            input::for_each_line(chunk, |line| {
-                let Some([click_id, user_id, campaign, ts]) = input::fields::<4>(line) else { return };
+            input::for_each_record::<4>(chunk, |rec| {
+                let Some([click_id, user_id, campaign, ts]) = rec else { return };
                 if click_id.is_empty() || user_id.is_empty() {
                     return;
                 }
@@ -606,9 +631,7 @@ fn run() {
         .fold(
             || Tally::new(campaigns, days),
             |mut tally, bi| {
-                let evs: Vec<&Event> = events.iter().flat_map(|e| &e[bi]).collect();
-                let cks: Vec<&Click> = clicks.iter().flat_map(|c| &c[bi]).collect();
-                person_bucket(evs, cks, &cx, &mut tally);
+                person_bucket(&events, &clicks, bi, &cx, &mut tally);
                 tally
             },
         )
@@ -657,4 +680,7 @@ fn run() {
         },
     );
     log(&format!("wrote {} user_daily rows", users.len()));
+    std::mem::forget(tally);
+    std::mem::forget(events);
+    std::mem::forget(clicks);
 }

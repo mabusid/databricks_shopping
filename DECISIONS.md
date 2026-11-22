@@ -13,6 +13,22 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Rust speed-ups, round 2 (after research)
+- **Context:** Attempt #4 scored 4.1392 s. 1BRC write-ups (curiouscoding.nl, morling.dev) and simdjson (Langdale & Lemire, arXiv 1902.08318) say the top parsers find all delimiters in a block at once and run at ~1–2.4 GB/s per core; ours was ~0.25 GB/s. A profiler (`/usr/bin/sample`, with `SHOPPING_REPEAT`) then showed 36% idle threads, 11% unbuffered `write`, 6% freeing memory, 11% linked-ID lookup, 10% timestamps
+- **Options:** A) Word-at-a-time (SWAR) delimiter scan. B) memchr3 SIMD scan. C) Keep the per-line memchr split
+- **Chose:** A, plus the other fixes below:
+  - Scanning: one pass per chunk finds commas, quotes and newlines 8 bytes at a time, splitting lines and fields together. It is fuzz-tested against the old splitter (20,000 random chunks). B was slower: 0.141 vs 0.127 s parse
+  - Person pass: a counting sort by person (two linear passes) replaces the big sorts; only per-person time sorts are left
+  - Parquet goes through an 8 MB `BufWriter`, flushed explicitly so an error stops the run
+  - Big tables are never freed (`mem::forget`), so no madvise/munmap cost before exit
+  - Chunks are 2 MB instead of 16 MB, which balances the threads better (clicks had only ~3 chunks at 3M)
+- **Pros:**
+  - 3M events: ~0.37 → ~0.30 s. Parse 0.147 → 0.119 s, person pass 0.082 → 0.062 s, dedup 0.033 → 0.025 s, clicks 0.038 → 0.024 s
+- **Cons / risks:**
+  - The Mac's timings are noisy (±0.03 s), so small gains are uncertain
+  - Not yet done: parallel linked-ID building (sequential today), cheaper timestamp parsing, multi-stream parsing
+- **Result:** — (attempt #5 pending)
+
 ## Rust speed-ups, round 1
 - **Context:** Attempt #3 scored 5.9099 s. Stage timers on 3M events (Mac, best of 7) put the time in parse 0.10 s, dedup 0.13 s, the person pass 0.085 s and the Parquet write 0.10 s; the whole run took 0.479 s
 - **Options:** A) The fixes below, keeping every comparison exact. B) Also tell people apart by a 128-bit name hash instead of comparing names. C) Also match linked IDs by a 128-bit hash
@@ -26,7 +42,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - B saved only ~0.009 s and isn't exact (a 1-in-10^26 chance of merging two people), so it was reverted under "never trade correctness for speed"
   - C gave no gain (the cost is the table probe, not the byte check), so it was reverted
-- **Result:** — (attempt #4 pending)
+- **Result:** Attempt #4: 5.9099 → 4.1392 s
 
 ## Engine: rewrite as a native Rust binary
 - **Context:** The leaderboard top is ~0.5 s on the ~20M practice set; we are at ~28 s with Polars, and halving our local time (attempt #2) did not move the score. Python + Polars start-up alone is ~0.3 s, so the top can't be reached from there
