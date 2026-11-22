@@ -3,12 +3,13 @@
 //! Reads  $DATA_DIR   (default /data)
 //! Writes $OUTPUT_DIR (default /output): user_daily/ and campaign_daily/ as Parquet
 //!
-//! The work runs in a few parallel passes over 256 hash buckets:
-//!   1. events: parse every copy, work out whether it is valid, bucket by event_id
+//! The work runs in a few parallel passes over 256 (or 1024) hash buckets:
+//!   1. events and clicks: parse every line. Each event copy leaves a small
+//!      dedup record in its event_id's bucket and, if the copy is valid, its
+//!      event in its person's bucket; each valid click goes to its person's bucket
 //!   2. per event_id bucket: keep each event's earliest copy (dedup before
-//!      validation), drop invalid ones, re-bucket by person
-//!   3. clicks: parse and validate, bucket by person
-//!   4. per person bucket: sessions, user_daily rows, click credit, assists
+//!      validation) and mark the events of all other copies dead
+//!   3. per person bucket: sessions, user_daily rows, click credit, assists
 //! Every field is a slice of the memory-mapped input; nothing is copied.
 
 mod blocks;
@@ -160,6 +161,7 @@ struct EventCopy {
 }
 
 const _: () = assert!(std::mem::size_of::<EventCopy>() == 64);
+const _: () = assert!(std::mem::size_of::<Dup>() == 32);
 const _: () = assert!(std::mem::size_of::<Event>() == 40);
 const _: () = assert!(std::mem::size_of::<Click>() == 40);
 
@@ -172,7 +174,8 @@ struct Lookups<'a> {
     unknown: u16,
 }
 
-/// A surviving event, with its person.
+/// A valid event copy, with its person. `dead`: dedup chose another copy of
+/// its event_id (set by pass 2), so it doesn't count.
 #[derive(Clone, Copy)]
 struct Event {
     person: PStr,
@@ -181,6 +184,54 @@ struct Event {
     price: i32,
     category: u16,
     event_type: u8,
+    dead: u8,
+}
+
+/// What dedup needs of one event copy (valid or not): its event_id, ingest_ts,
+/// and where its Event is (0 if the copy isn't valid and has none).
+#[derive(Clone, Copy)]
+struct Dup {
+    h: u64, // hash of event_id
+    event_id: PStr,
+    ingest: i64,
+    event: usize, // *mut Event, as an address
+}
+
+/// Mark the Event of a copy that dedup did not keep.
+#[inline]
+fn kill(d: &Dup) {
+    if d.event != 0 {
+        // SAFETY: `event` is the address `BlockList::push` returned for this copy's
+        // Event; its list lives (unreleased, unborrowed) until the person pass, and
+        // each copy is in exactly one dedup bucket, so no other thread writes it.
+        unsafe { std::ptr::addr_of_mut!((*(d.event as *mut Event)).dead).write(1) };
+    }
+}
+
+/// Each worker thread's lists from pass 1, one per bucket.
+struct ParseLists {
+    dups: Vec<BlockList<Dup>>,
+    events: Vec<BlockList<Event>>,
+    clicks: Vec<BlockList<Click>>,
+}
+
+impl ParseLists {
+    fn new() -> ParseLists {
+        ParseLists { dups: new_lists(), events: new_lists(), clicks: new_lists() }
+    }
+
+    /// File one parsed event copy: its event (if valid) by person, its dedup record by event_id.
+    #[inline]
+    fn add(&mut self, c: EventCopy) {
+        let event = if c.ok {
+            self.events[bucket(c.key.0)].push(Event {
+                person: c.person, key: c.key, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type, dead: 0,
+            }) as usize
+        } else {
+            0
+        };
+        self.dups[bucket(c.h)].push(Dup { h: c.h, event_id: c.event_id, ingest: c.ingest, event });
+    }
 }
 
 /// A valid click, with its person.
@@ -648,12 +699,13 @@ struct Context {
 /// placed person by person with a counting sort (two linear passes), so the
 /// only sorting left is by time within each person.
 fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &Context, tally: &mut Tally) {
-    let n_events: usize = events.iter().map(|l| l.len()).sum();
-    let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_events / 4 + 16);
+    let n_copies: usize = events.iter().map(|l| l.len()).sum();
+    let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_copies / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
     let mut counts: Vec<u32> = Vec::new();
-    let mut ids: Vec<u32> = Vec::with_capacity(n_events);
-    for e in events.iter().flat_map(|l| l.iter()) {
+    let mut ids: Vec<u32> = Vec::with_capacity(n_copies);
+    let live = || events.iter().flat_map(|l| l.iter()).filter(|e| e.dead == 0);
+    for e in live() {
         let id = match number.entry(e.key.0, |&(k, _)| k == e.key, |x| x.0.0) {
             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
             hashbrown::hash_table::Entry::Vacant(v) => {
@@ -673,8 +725,8 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
         ev_at[p + 1] = ev_at[p] + counts[p];
     }
     let mut fill: Vec<u32> = ev_at[..people].to_vec();
-    let mut evs: Vec<(i64, i32, u16, u8)> = vec![(0, 0, 0, 0); n_events];
-    for (e, &id) in events.iter().flat_map(|l| l.iter()).zip(&ids) {
+    let mut evs: Vec<(i64, i32, u16, u8)> = vec![(0, 0, 0, 0); ids.len()];
+    for (e, &id) in live().zip(&ids) {
         let at = &mut fill[id as usize];
         evs[*at as usize] = (e.ts, e.price, e.category, e.event_type);
         *at += 1;
@@ -893,7 +945,7 @@ fn run() {
     let links = person_names(&data.join("links"));
     log("small tables and linked IDs");
 
-    // Pass 1: parse every event copy, bucketed by event_id.
+    // Event chunks, and the bucket count.
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
     // 256 buckets, or 1024 for inputs over 1 GB of events (~10M+), so each
@@ -906,94 +958,93 @@ fn run() {
     let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(default_bits);
     BUCKET_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
     let threads = rayon::current_num_threads();
-    // Bucket lists are kept per worker thread, not per chunk, so their number
-    // depends on the threads, not on the input size.
-    let copies: Vec<Vec<BlockList<EventCopy>>> = per_thread(threads, new_lists::<EventCopy>, |acc| {
-        event_chunks.par_iter().for_each(|&chunk| {
+    // Pass 1: parse every event copy and every click. Bucket lists are kept per
+    // worker thread, not per chunk, so their number depends on the threads, not
+    // on the input size. Clicks: copies of a click are identical, so dedup can
+    // change neither credit (same ts and click_id) nor assists (each campaign
+    // counts once): it is skipped.
+    let click_chunks = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES);
+    let work: Vec<(bool, &'static [u8])> =
+        event_chunks.iter().map(|&c| (false, c)).chain(click_chunks.iter().map(|&c| (true, c))).collect();
+    let lists: Vec<ParseLists> = per_thread(threads, ParseLists::new, |acc| {
+        work.par_iter().for_each(|&(is_click, chunk)| {
             let mut b = acc();
+            if is_click {
+                input::for_each_record::<4>(chunk, |rec| {
+                    let Some([click_id, user_id, campaign, ts]) = rec else { return };
+                    if click_id.is_empty() || user_id.is_empty() {
+                        return;
+                    }
+                    let ts = ts_ms(ts);
+                    if ts < start - WEEK || ts >= end {
+                        return; // the click window, a week longer than the event window
+                    }
+                    let Some(&campaign) = campaign_index.get(campaign) else { return };
+                    let (_, key) = links.person_of(user_id);
+                    b.clicks[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
+                });
+                return;
+            }
             let mut ring: [Option<Pending>; PIPELINE] = [None; PIPELINE];
             let mut at = 0;
             input::for_each_record::<7>(chunk, |rec| {
                 if let Some(p) = rec.and_then(|f| parse_event(f, &lookups)) {
                     if let Some(old) = ring[at].replace(p) {
-                        let c = finish_event(old, &links);
-                        b[bucket(c.h)].push(c);
+                        b.add(finish_event(old, &links));
                     }
                     at = (at + 1) % PIPELINE;
                 }
             });
             for k in 0..PIPELINE {
                 if let Some(old) = ring[(at + k) % PIPELINE].take() {
-                    let c = finish_event(old, &links);
-                    b[bucket(c.h)].push(c);
+                    b.add(finish_event(old, &links));
                 }
             }
         });
     });
-    log("events parsed");
+    log("events and clicks parsed");
 
-    // Pass 2: dedup before validation (each event_id's earliest copy, valid or
-    // not), drop invalid events, re-bucket the survivors by person.
-    // Each bucket's copy blocks go back to the pool as soon as it is done, so the
-    // event (and later click) lists reuse memory that is already mapped.
-    let copies = by_bucket(copies);
-    let events: Vec<Vec<BlockList<Event>>> = per_thread(threads, new_lists::<Event>, |acc| {
-        copies.into_par_iter().for_each(|lists| {
-            let mut b = acc();
-            let n: usize = lists.iter().map(|l| l.len()).sum();
-            let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
-            let mut kept: Vec<&EventCopy> = Vec::with_capacity(n);
-            for c in lists.iter().flat_map(|l| l.iter()) {
-                match first.entry(c.h, |&(h, k)| h == c.h && kept[k as usize].event_id.same(c.event_id), |e| e.0) {
-                    hashbrown::hash_table::Entry::Occupied(e) => {
-                        let k = e.get().1 as usize;
-                        if c.ingest < kept[k].ingest {
-                            kept[k] = c; // copies with equal ingest_ts are identical
-                        }
+    // Pass 2: dedup before validation. Per event_id, the copy with the smallest
+    // ingest_ts is kept (copies with equal ingest_ts are identical: the first
+    // seen is kept); the events of all other copies are marked dead. If the kept
+    // copy is invalid it has no event, so the event is dropped.
+    let mut dups = Vec::with_capacity(threads);
+    let mut events = Vec::with_capacity(threads);
+    let mut clicks = Vec::with_capacity(threads);
+    for l in lists {
+        dups.push(l.dups);
+        events.push(l.events);
+        clicks.push(l.clicks);
+    }
+    by_bucket(dups).into_par_iter().for_each(|lists| {
+        let n: usize = lists.iter().map(|l| l.len()).sum();
+        let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
+        let mut kept: Vec<&Dup> = Vec::with_capacity(n);
+        for d in lists.iter().flat_map(|l| l.iter()) {
+            match first.entry(d.h, |&(h, k)| h == d.h && kept[k as usize].event_id.same(d.event_id), |e| e.0) {
+                hashbrown::hash_table::Entry::Occupied(e) => {
+                    let k = e.get().1 as usize;
+                    if d.ingest < kept[k].ingest {
+                        kill(kept[k]);
+                        kept[k] = d;
+                    } else {
+                        kill(d);
                     }
-                    hashbrown::hash_table::Entry::Vacant(e) => {
-                        e.insert((c.h, kept.len() as u32));
-                        kept.push(c);
-                    }
+                }
+                hashbrown::hash_table::Entry::Vacant(e) => {
+                    e.insert((d.h, kept.len() as u32));
+                    kept.push(d);
                 }
             }
-            for c in kept.into_iter().filter(|c| c.ok) {
-                b[bucket(c.key.0)].push(Event {
-                    person: c.person, key: c.key, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
-                });
-            }
-            for l in lists {
-                l.release();
-            }
-        });
+        }
+        drop(kept);
+        for l in lists {
+            l.release();
+        }
     });
-    log("events deduped and validated");
+    log("events deduped");
 
-    // Pass 3: clicks. Copies of a click are identical, so dedup can change
-    // neither credit (same ts and click_id) nor assists (each campaign counts
-    // once): it is skipped.
-    let click_chunks = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES);
-    let clicks: Vec<Vec<BlockList<Click>>> = per_thread(threads, new_lists::<Click>, |acc| {
-        click_chunks.par_iter().for_each(|&chunk| {
-            let mut b = acc();
-            input::for_each_record::<4>(chunk, |rec| {
-                let Some([click_id, user_id, campaign, ts]) = rec else { return };
-                if click_id.is_empty() || user_id.is_empty() {
-                    return;
-                }
-                let ts = ts_ms(ts);
-                if ts < start - WEEK || ts >= end {
-                    return; // the click window, a week longer than the event window
-                }
-                let Some(&campaign) = campaign_index.get(campaign) else { return };
-                let (_, key) = links.person_of(user_id);
-                b[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
-            });
-        });
-    });
-    log("clicks parsed");
-
-    // Pass 4: per person bucket.
+    // Pass 3: per person bucket.
     let cx = Context { base_day, days, campaigns, categories: category_names.len(), category_order };
     // One tally per worker thread (rayon's fold made one per work split, and
     // merging dozens of them cost ~3%); only the campaign counts are merged.

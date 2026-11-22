@@ -59,16 +59,20 @@ impl<T: Copy> BlockList<T> {
         BlockList { blocks: Vec::new(), in_last: 0, len: 0, _t: PhantomData }
     }
 
+    /// Append `v`; returns where it is stored. Blocks never move, so the address
+    /// stays valid until the list is released.
     #[inline]
-    pub fn push(&mut self, v: T) {
+    pub fn push(&mut self, v: T) -> *mut T {
         if self.blocks.is_empty() || self.in_last == Self::PER_BLOCK {
             self.blocks.push(take_block() as *mut T);
             self.in_last = 0;
         }
         // SAFETY: the last block has room for PER_BLOCK elements and in_last < PER_BLOCK.
-        unsafe { self.blocks.last().unwrap().add(self.in_last).write(v) };
+        let at = unsafe { self.blocks.last().unwrap().add(self.in_last) };
+        unsafe { at.write(v) };
         self.in_last += 1;
         self.len += 1;
+        at
     }
 
     pub fn len(&self) -> usize {
