@@ -13,6 +13,28 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Output: one tally per thread, null and non-null rows in separate parts
+- **Context:** Linux `perf` on #11 (2M events): `Tally::merge` 2.7%; Parquet bit-packing of `top_category`'s null markers 3.5%. rayon's `fold` made a tally per work split, so dozens of ~1 MB campaign × day arrays were merged pairwise
+- **Options:** A) One tally per worker thread (the `per_thread` helper), merging only the campaign counts once. User rows stay in each thread's lists, split into "has a top category" and "none", one Parquet part each. B) Our own Parquet writer
+- **Chose:** A first; it's small. Row order doesn't matter, so each part's null markers form one run, which Parquet stores run-length encoded instead of bit-packed
+- **Pros:**
+  - Linux proxy (2M events, 4 threads, interleaved with #11's build): best 0.239 → 0.211 s, mean 0.289 → 0.266 s
+- **Cons / risks:**
+  - Up to 2 × threads part files (16), which the rules allow
+  - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds
+  - Also tested and dropped: freeing the copy buffers after dedup, with and without glibc keeping freed memory. Interleaved A/B on 2M showed no difference (best 0.235 / 0.243 / 0.235 s)
+- **Result:** — (attempt #12 pending)
+
+## SIMD delimiter scan
+- **Context:** Scanning and per-line glue were the biggest cost on Linux (~27%). simdjson's stage 1 builds structural bitmasks 64 bytes at a time
+- **Options:** A) SSE2 on x86-64 (baseline, so no runtime check, and testable under emulation), NEON on arm64, 8-byte words elsewhere. B) AVX2/AVX-512 with runtime detection (untestable here: the emulator lacks AVX2)
+- **Chose:** A. Each 64-byte block becomes comma, quote and newline masks; the 8-byte loop handles the tail
+- **Pros:**
+  - Parse ~0.102 → ~0.093 s on the M1. Linux proxy (3M) 0.42 → 0.37 s
+- **Cons / risks:**
+  - Arch-specific unsafe code. Fuzz test (50k random chunks up to 300 bytes) passes on arm64 and on x86-64 under emulation; the amd64 image matches the dev answer and 36/36 fixtures
+- **Result:** — (attempt #11 pending)
+
 ## Bloom filter in front of the linked-ID table
 - **Context:** Every event and click looks up its ID in the linked-ID table, which at 20M holds ~1.2M entries of 48 bytes (~60 MB), far beyond a Xeon core's cache. 38% of events (dev set and 3M set) come from IDs in no link, which find nothing
 - **Options:** A) A blocked Bloom filter: 8+ bits per linked ID, 2 bits per key in one 512-bit block (one cache line). A clear bit means "not linked" for sure, so the table is skipped. B) Leave the lookups as they are

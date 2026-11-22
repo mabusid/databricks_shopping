@@ -2,4 +2,4 @@
 
 Name: lukaku
 Members: Muhammad Siddiq, Muhammad Ghani
-Engine: Polars
+Engine: Rust (native, from scratch; no dataframe engine)

@@ -415,7 +415,10 @@ fn window(data: &Path) -> (i64, i64) {
 
 /// Per-thread results of the person pass.
 struct Tally {
+    /// user_daily rows with a top_category, and without (kept apart so each
+    /// Parquet part's null markers are one run, cheap to encode).
     users: Vec<UserRow>,
+    users_no_top: Vec<UserRow>,
     /// [(campaign or organic) * days + day] -> (sessions, purchasing sessions, revenue)
     credited: Vec<[i64; 3]>,
     /// [campaign * days + day] -> assisted sessions
@@ -424,10 +427,18 @@ struct Tally {
 
 impl Tally {
     fn new(campaigns: usize, days: usize) -> Tally {
-        Tally { users: Vec::new(), credited: vec![[0; 3]; (campaigns + 1) * days], assisted: vec![0; campaigns * days] }
+        Tally {
+            users: Vec::new(),
+            users_no_top: Vec::new(),
+            credited: vec![[0; 3]; (campaigns + 1) * days],
+            assisted: vec![0; campaigns * days],
+        }
     }
-    fn merge(mut self, other: Tally) -> Tally {
-        self.users.extend(other.users);
+    fn push_user(&mut self, row: UserRow) {
+        if row.top.is_some() { self.users.push(row) } else { self.users_no_top.push(row) }
+    }
+    /// Add another thread's campaign counts to these (its user rows stay where they are).
+    fn add_counts(&mut self, other: &Tally) {
         for (a, b) in self.credited.iter_mut().zip(&other.credited) {
             for k in 0..3 {
                 a[k] += b[k];
@@ -436,7 +447,6 @@ impl Tally {
         for (a, b) in self.assisted.iter_mut().zip(&other.assisted) {
             *a += b;
         }
-        self
     }
 }
 
@@ -539,7 +549,7 @@ fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usi
             if sessions.is_empty() || ts - prev > SESSION_GAP {
                 let day = (ts.div_euclid(DAY) - cx.base_day) as usize; // rule 6: the start's UTC date
                 if row.as_ref().is_some_and(|r| r.day as i64 != cx.base_day + day as i64) {
-                    tally.users.push(finish_row(row.take().unwrap(), &mut spend, cx));
+                    tally.push_user(finish_row(row.take().unwrap(), &mut spend, cx));
                 }
                 let r = row.get_or_insert(UserRow {
                     person: names[p],
@@ -563,7 +573,7 @@ fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usi
                 s.revenue += price;
             }
         }
-        tally.users.push(finish_row(row.take().unwrap(), &mut spend, cx));
+        tally.push_user(finish_row(row.take().unwrap(), &mut spend, cx));
 
         let clicks = &mut cks[ck_at[p] as usize..ck_at[p + 1] as usize];
         if clicks.is_empty() {
@@ -788,20 +798,18 @@ fn run() {
 
     // Pass 4: per person bucket.
     let cx = Context { base_day, days, campaigns, categories: category_names.len(), category_order };
-    let tally = (0..nb)
-        .into_par_iter()
-        .fold(
-            || Tally::new(campaigns, days),
-            |mut tally, bi| {
-                person_bucket(&events, &clicks, bi, &cx, &mut tally);
-                tally
-            },
-        )
-        .reduce(|| Tally::new(campaigns, days), Tally::merge);
+    // One tally per worker thread (rayon's fold made one per work split, and
+    // merging dozens of them cost ~3%); only the campaign counts are merged.
+    let tallies: Vec<Tally> = per_thread(threads, || Tally::new(campaigns, days), |acc| {
+        (0..nb).into_par_iter().for_each(|bi| person_bucket(&events, &clicks, bi, &cx, &mut acc()));
+    });
+    let mut tally = Tally::new(campaigns, days);
+    for t in &tallies {
+        tally.add_counts(t);
+    }
     log("sessions, credit and assists");
 
     // Output.
-    let users = &tally.users;
     let mut cols = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for c in 0..=campaigns {
         for d in 0..days {
@@ -818,11 +826,16 @@ fn run() {
             }
         }
     }
-    // user_daily is large: one part file per thread, written in parallel.
-    let part_rows = users.len().div_ceil(rayon::current_num_threads()).max(1);
+    // user_daily is large: each thread's rows with and without a top_category
+    // are separate part files, written in parallel.
+    let mut parts: Vec<&[UserRow]> =
+        tallies.iter().flat_map(|t| [&t.users[..], &t.users_no_top[..]]).filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        parts.push(&[]); // still write one (empty) file with the schema
+    }
+    let user_rows: usize = parts.iter().map(|p| p.len()).sum();
     rayon::join(
         || {
-            let parts: Vec<&[UserRow]> = if users.is_empty() { vec![&users[..]] } else { users.chunks(part_rows).collect() };
             parts.par_iter().enumerate().for_each(|(part, users)| {
                 output::write_table(&out, "user_daily", part, output::USER_DAILY, vec![
                     Column::Str(users.iter().map(|u| u.person).collect()),
@@ -841,8 +854,8 @@ fn run() {
             ])
         },
     );
-    log(&format!("wrote {} user_daily rows", users.len()));
-    std::mem::forget(tally);
+    log(&format!("wrote {user_rows} user_daily rows"));
+    std::mem::forget(tallies);
     std::mem::forget(events);
     std::mem::forget(clicks);
 }

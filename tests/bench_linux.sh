@@ -7,6 +7,7 @@
 #             generator/target/release/generate --seed 1 --events 3000000 --clicks 750000 --output /tmp/s1-3m
 #   RUNS      runs to take the fastest of (default 7)
 #   SRC_DIR   the crate to build (default native/)
+# BENCH_ENV="A=1 B=2" passes environment variables to the runs.
 # Prints the fastest time of each stage, then wall/user/kernel time and page faults.
 set -eu
 cd "$(dirname "$0")/.."
@@ -24,7 +25,8 @@ docker run --rm --platform linux/arm64 -v "$SRC":/src:ro -v "$OUT":/out \
 
 # Run with the data copied into the container (Docker's shared folders are slow), like the scorer.
 docker run --rm --platform linux/arm64 --cpus 4 --memory 3g -v "$DATA":/src:ro -v "$OUT":/x \
-  -e NCPU=4 debian:bookworm-slim sh -c "
+  -e NCPU=4 -e BENCH_ENV="${BENCH_ENV:-}" debian:bookworm-slim sh -c "
+  [ -n \"\$BENCH_ENV\" ] && export \$BENCH_ENV
   apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq time >/dev/null 2>&1
   cp -r /src /tmp/d; export DATA_DIR=/tmp/d OUTPUT_DIR=/tmp/o
   for i in \$(seq 1 $RUNS); do rm -rf /tmp/o; mkdir /tmp/o
