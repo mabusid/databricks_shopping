@@ -13,6 +13,27 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Test cleaning against a plain-Python oracle
+- **Context:** The fixtures check only the final tables, so they can't test step 3 until steps 4–6 exist
+- **Options:** A) A second, literal plain-Python version of the rules (`tests/oracle.py`), compared row by row (`tests/check_clean.py`). B) Wait for the fixtures at step 7
+- **Chose:** A
+- **Pros:**
+  - Finds cleaning bugs now, on all fixtures and the 1M-event dev set
+  - The oracle can grow with steps 4–6
+- **Cons / risks:**
+  - Both versions are ours and could share a misreading, so the counts were also checked against `fixtures/README.md`
+- **Result:** — (no submission yet). The check passes 37/37 (36 fixtures + dev set)
+
+## Our own timestamp parser
+- **Context:** The rules reject inputs that common parsers accept: lowercase `z`, offsets without a colon, second 60, Unicode digits, F3 values beyond 64 bits
+- **Options:** A) A regex for the shape, then range checks and date arithmetic in Polars expressions. B) Polars `str.to_datetime` with formats
+- **Chose:** A, because every accepted form is spelled out in our code
+- **Pros:**
+  - Exact control, and still vectorized
+- **Cons / risks:**
+  - More code. Every branch is computed for every row, which may cost time (profile at step 8)
+- **Result:** —
+
 ## Engine: the Polars starter
 - **Context:** Only one starter can sit at the repo root, because the scorer builds one Dockerfile. Score is run time; the PySpark baseline is 169.6 s against a 180 s limit
 - **Options:** A) Polars. B) DuckDB. C) PySpark

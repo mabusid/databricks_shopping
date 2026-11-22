@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Shopping Sessions: Polars starter (skeleton).
-
-This runs end to end inside the scorer's container and writes both output tables
-with the exact schema, but the tables are EMPTY, so the checker will mark it
-incorrect. It gives you the plumbing; the rules are yours to implement.
+Shopping Sessions pipeline (Polars). The rules are in rules/rules.md.
 
 Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
+
+Status: step 3 (clean the logs) is done. Steps 4-6 are still to do, so the
+output tables are still written empty.
 """
 import glob
 import json
+import mmap
 import os
+from datetime import datetime
 
 NCPU = os.environ.get("NCPU")
 if NCPU:
@@ -25,27 +26,224 @@ DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
 SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 
-with open(os.path.join(DATA, "manifest.json")) as f:
-    manifest = json.load(f)
-print("window:", manifest["window_start"], "to", manifest["window_end"])
-print("polars threads:", pl.thread_pool_size())
+DAY_MS = 86_400_000
+WEEK_MS = 7 * DAY_MS
+MAX_PRICE = 10_000_000
 
-event_files = sorted(glob.glob(os.path.join(DATA, "events", "*.csv")))
-click_files = sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv")))
-print(f"{len(event_files)} event files, {len(click_files)} click files")
+EVENT_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
+CLICK_COLS = ["click_id", "user_id", "campaign_id", "ts"]
+LINK_COLS = ["user_id_a", "user_id_b"]
+PRODUCT_COLS = ["product_id", "category"]
+CAMPAIGN_COLS = ["campaign_id", "channel"]
+EVENT_TYPES = ["view", "cart", "purchase"]
 
-# TODO: implement the rules.
-#   Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
-#           -> validate -> drop late -> sessionize per user (gap > 30 min)
-#           -> day of session start -> categories
-#   Clicks: parse -> dedup -> validate -> credit each session to the latest
-#           click at or before its start, within 7 days (ties: smallest click_id)
-#
-# Careful with Polars' CSV reader: it handles malformed lines and quoting its own
-# way, which is not necessarily the spec's way. Check it against the fixtures.
-# Lazy frames (pl.scan_csv / LazyFrame.collect(engine="streaming")) help with
-# memory at full size; the container has about 24 GB and no swap.
 
+# --- Reading lines -------------------------------------------------------------
+# Polars reads each line as one string column. It must never split a line, so
+# we use a separator byte the data does not hold, and no quote character.
+# Polars' reader strips a trailing \r, but the rules say \r is an ordinary
+# character, and it might split on a line holding the separator. So any file
+# holding either byte is split exactly in Python instead (the generator never
+# writes a \r, so in practice that is only fixture E20).
+SEP = "\x1f"
+
+
+def needs_exact_split(path):
+    """True if Polars' line reader could change this file's lines."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size == 0:
+            return False
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            return mm.find(b"\r") != -1 or mm.find(SEP.encode()) != -1
+
+
+def exact_lines(path):
+    """The file's lines after the header, split on \\n only, nothing stripped."""
+    with open(path, "rb") as f:
+        lines = f.read().decode("utf-8").split("\n")[1:]
+    if lines and lines[-1] == "":
+        lines.pop()  # the file's final \n ends the last line; it does not start a new one
+    return lines
+
+
+def read_lines(paths):
+    """Every data line of every file, unchanged, as a LazyFrame with one column `line`.
+
+    Each file's first line is its header and is skipped. A later line equal to
+    the header is data (fixture L3). An empty line comes through as null, and
+    the field check drops it, as the rules drop empty lines.
+    """
+    paths = [p for p in paths if os.path.getsize(p) > 0]  # an empty file has no data lines
+    fast = [p for p in paths if not needs_exact_split(p)]
+    exact = [p for p in paths if p not in fast]
+    frames = []
+    if fast:
+        # skip_lines=1 skips each file's header line (checked on all fixtures and the dev set).
+        frames.append(pl.scan_csv(fast, has_header=False, skip_lines=1, separator=SEP,
+                                  quote_char=None, schema={"line": pl.String}))
+    for path in exact:
+        frames.append(pl.LazyFrame({"line": exact_lines(path)}, schema={"line": pl.String}))
+    if not frames:
+        return pl.LazyFrame(schema={"line": pl.String})
+    return pl.concat(frames)
+
+
+# --- CSV dialect ---------------------------------------------------------------
+# A field is either wrapped in quotes with no quote or comma inside, or holds no
+# quote at all. Values never hold a comma, so every comma separates fields.
+FIELD = '(?:"[^",]*"|[^",]*)'
+
+
+def split_fields(lines, names):
+    """Drop malformed lines and split the rest into string columns `names`.
+
+    A line is malformed unless it has exactly len(names) fields, each either
+    fully quoted or without quotes. Quotes are syntax, so they are removed.
+    An empty field (`` or `""`) becomes null. Spaces are kept.
+    """
+    pattern = "^" + FIELD + "(?:," + FIELD + "){" + str(len(names) - 1) + "}$"
+    return (
+        lines.filter(pl.col("line").str.contains(pattern))
+        .select(pl.col("line").str.split_exact(",", len(names) - 1).struct.rename_fields(names))
+        .unnest("line")
+        .with_columns(pl.col(c).str.strip_chars('"') for c in names)
+        .with_columns(pl.when(pl.col(c) != "").then(pl.col(c)).alias(c) for c in names)
+    )
+
+
+# --- Timestamps ----------------------------------------------------------------
+# F1 2026-10-03T23:58:10Z, F2 2026-10-03T19:58:10-04:00, F3 epoch milliseconds.
+# Our own checks and arithmetic, so we control exactly what is accepted.
+ISO_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+DIGITS_RE = r"^[0-9]+$"
+
+
+def _int(s, start, end):
+    """Characters [start, end) of s as an integer (null if not a number)."""
+    return s.str.slice(start, end - start).cast(pl.Int64, strict=False)
+
+
+def digits_value(s, max_len):
+    """The value of a digits-only string with leading zeros ignored, or null if it
+    has more than max_len significant digits. Call only where s is digits only."""
+    stripped = s.str.strip_chars_start("0")
+    return (pl.when(stripped == "").then(0)
+            .when(stripped.str.len_bytes() <= max_len).then(stripped.cast(pl.Int64, strict=False)))
+
+
+def parse_ts(s):
+    """Timestamp string -> integer ms since the epoch, UTC; null if it is bad.
+
+    The window check is separate. A value with more than 18 significant F3
+    digits is null: at least 10^18 ms, it is far outside any window.
+    """
+    year, month, day = _int(s, 0, 4), _int(s, 5, 7), _int(s, 8, 10)
+    hour, minute, second = _int(s, 11, 13), _int(s, 14, 16), _int(s, 17, 19)
+    off_hour, off_minute = _int(s, 20, 22), _int(s, 23, 25)
+    is_utc = s.str.slice(19, 1) == "Z"
+    sign = pl.when(s.str.slice(19, 1) == "-").then(-1).otherwise(1)
+    offset_s = pl.when(is_utc).then(0).otherwise(sign * (off_hour * 3600 + off_minute * 60))
+
+    leap = ((year % 4 == 0) & (year % 100 != 0)) | (year % 400 == 0)
+    days_in_month = (pl.when(month == 2).then(pl.when(leap).then(29).otherwise(28))
+                     .when(month.is_in([4, 6, 9, 11])).then(30)
+                     .otherwise(31))
+    iso_ok = (
+        s.str.contains(ISO_RE)
+        & month.is_between(1, 12) & day.is_between(1, days_in_month)
+        & (hour <= 23) & (minute <= 59) & (second <= 59)
+        & (is_utc | ((off_hour <= 23) & (off_minute <= 59)))
+    )
+    # Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant's days_from_civil).
+    y = year - (month <= 2).cast(pl.Int64)
+    era = y // 400
+    yoe = y - era * 400
+    doy = (153 * ((month + 9) % 12) + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    days = era * 146097 + doe - 719468
+    iso_ms = (days * 86400 + hour * 3600 + minute * 60 + second - offset_s) * 1000
+
+    return (pl.when(iso_ok).then(iso_ms)
+            .when(s.str.contains(DIGITS_RE)).then(digits_value(s, 18)))
+
+
+def window_ms(manifest):
+    """(window_start, window_end) from manifest.json, in ms since the epoch."""
+    def ms(text):
+        return int(datetime.fromisoformat(text).timestamp()) * 1000
+    return ms(manifest["window_start"]), ms(manifest["window_end"])
+
+
+# --- Cleaning (README step 3) --------------------------------------------------
+def csv_files(folder):
+    return sorted(glob.glob(os.path.join(folder, "*.csv")))
+
+
+def clean_events(data_dir, start, end):
+    """Events rules 1-4: parse, dedup, validate, drop late.
+
+    Columns: event_id, user_id, ts (ms), event_type, product_id,
+    price_cents (the price for a purchase, 0 otherwise).
+    """
+    events = (
+        split_fields(read_lines(csv_files(os.path.join(data_dir, "events"))), EVENT_COLS)
+        .filter(pl.col("event_id").is_not_null())
+        .with_columns(pl.col("ingest_ts").pipe(parse_ts).alias("ingest_ms"))
+    )
+    # Dedup before validation: keep the copy with the smallest ingest_ts.
+    # Copies with equal ingest_ts are identical, so any one of them will do.
+    events = (
+        events.filter(pl.col("ingest_ms") == pl.col("ingest_ms").min().over("event_id"))
+        .unique(subset="event_id", keep="any")
+    )
+    is_purchase = pl.col("event_type") == "purchase"
+    price = pl.col("price_cents")
+    price_value = pl.when(price.str.contains(DIGITS_RE)).then(digits_value(price, 8))
+    events = events.with_columns(
+        pl.col("ts").pipe(parse_ts).alias("ts_ms"),
+        pl.when(is_purchase).then(price_value).otherwise(0).alias("price_value"),
+    )
+    return (
+        events.filter(
+            pl.col("user_id").is_not_null()
+            & pl.col("ts_ms").is_between(start, end, closed="left")
+            & pl.col("event_type").is_in(EVENT_TYPES)
+            & pl.col("product_id").is_not_null()
+            & (~is_purchase | pl.col("price_value").is_between(1, MAX_PRICE))
+            & (pl.col("ingest_ms") - pl.col("ts_ms") <= DAY_MS)  # late: strictly over 24 h
+        )
+        .select("event_id", "user_id", pl.col("ts_ms").alias("ts"), "event_type", "product_id",
+                pl.col("price_value").alias("price_cents"))
+    )
+
+
+def clean_clicks(data_dir, start, end, campaigns):
+    """Clicks rules 1-3: parse, dedup, validate. Columns: click_id, user_id, campaign_id, ts (ms)."""
+    clicks = (
+        split_fields(read_lines(csv_files(os.path.join(data_dir, "clicks"))), CLICK_COLS)
+        .filter(pl.col("click_id").is_not_null())
+        .unique(subset="click_id", keep="any")  # copies are identical
+        .with_columns(pl.col("ts").pipe(parse_ts))
+    )
+    return clicks.filter(
+        pl.col("user_id").is_not_null()
+        & pl.col("ts").is_between(start - WEEK_MS, end, closed="left")
+        & pl.col("campaign_id").is_in(campaigns["campaign_id"].implode())
+    ).select(CLICK_COLS)
+
+
+def clean_links(data_dir):
+    """Linked IDs rule 1: parse, drop lines with an empty side. Columns: user_id_a, user_id_b."""
+    links = split_fields(read_lines(csv_files(os.path.join(data_dir, "links"))), LINK_COLS)
+    return links.drop_nulls()
+
+
+def read_table(path, names):
+    """products.csv or campaigns.csv: clean files, read with the same dialect rules."""
+    return split_fields(read_lines([path]), names).collect()
+
+
+# --- Output --------------------------------------------------------------------
 USER_DAILY = {
     "user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
     "events": pl.Int64, "revenue_cents": pl.Int64, "top_category": pl.String,
@@ -56,9 +254,28 @@ CAMPAIGN_DAILY = {
     "assisted_sessions": pl.Int64,
 }
 
-# Write both tables with the exact schema the checker expects.
-for name, schema in (("user_daily", USER_DAILY), ("campaign_daily", CAMPAIGN_DAILY)):
-    folder = os.path.join(OUT, name)
-    os.makedirs(folder, exist_ok=True)
-    pl.DataFrame(schema=schema).write_parquet(os.path.join(folder, "part-0.parquet"))
-print("wrote empty user_daily and campaign_daily (skeleton)")
+
+def main():
+    with open(os.path.join(DATA, "manifest.json")) as f:
+        manifest = json.load(f)
+    start, end = window_ms(manifest)
+    print("window:", manifest["window_start"], "to", manifest["window_end"])
+    print("polars threads:", pl.thread_pool_size())
+
+    products = read_table(os.path.join(DATA, "products.csv"), PRODUCT_COLS)  # noqa: F841 (step 5)
+    campaigns = read_table(os.path.join(DATA, "campaigns.csv"), CAMPAIGN_COLS)
+    events = clean_events(DATA, start, end)  # noqa: F841 (steps 4-6)
+    clicks = clean_clicks(DATA, start, end, campaigns)  # noqa: F841 (steps 4-6)
+    links = clean_links(DATA)  # noqa: F841 (step 4)
+
+    # TODO steps 4-6: join each person's IDs, build sessions, credit clicks and assists.
+    # Until then both tables are written empty, with the exact schema.
+    for name, schema in (("user_daily", USER_DAILY), ("campaign_daily", CAMPAIGN_DAILY)):
+        folder = os.path.join(OUT, name)
+        os.makedirs(folder, exist_ok=True)
+        pl.DataFrame(schema=schema).write_parquet(os.path.join(folder, "part-0.parquet"))
+    print("wrote empty user_daily and campaign_daily (steps 4-6 to do)")
+
+
+if __name__ == "__main__":
+    main()

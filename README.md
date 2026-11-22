@@ -11,11 +11,19 @@ Score = container run time, start to exit. A nearly correct answer scores 0.
 - `fixtures/`: the 36 edge-case fixtures
 - `pipeline/pipeline.py`: our pipeline; `scripts/`: the starter's run and diff scripts
 - `data/`: the dev data (gitignored); `dev-answer/`: its expected output (gitignored)
+- `tests/`: `oracle.py`, a slow plain-Python reading of the rules, and the checks built on it
+
+## Test
+```sh
+.venv/bin/python tests/check_clean.py fixtures/*/input data                          # cleaning vs the oracle
+.venv/bin/python scripts/run_fixtures.py fixtures -- .venv/bin/python pipeline/pipeline.py   # the 36 fixtures, no Docker
+make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                       # the 36 fixtures in Docker
+```
 
 ## Plan
 1. [x] Get rules.md, a starter, the fixtures and the dev data
 2. [x] Choose an engine (log it in DECISIONS.md): Polars
-3. [ ] Clean the logs
+3. [x] Clean the logs (checked by `tests/check_clean.py`)
 4. [ ] Join each person's IDs
 5. [ ] Build sessions
 6. [ ] Credit sessions to ad clicks, count assisting campaigns
