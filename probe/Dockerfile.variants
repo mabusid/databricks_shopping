@@ -17,6 +17,9 @@ RUN mkdir /bin-out && T=x86_64-unknown-linux-gnu && first=1 && for v in $(ls /va
           cp "$(sed -n 's/.*(\(\/t3\/[^)]*\)).*/\1/p' /tmp/t.log | head -1)" /bin-out/tests-v3; fi; \
       else cargo build --release --locked --offline --bin shopping && cp target/release/shopping /bin-out/$v-v3; fi && \
       first=0; done && ls -la /bin-out
+# The writer (this branch's own code, default CPU) writes the dev output and the report rows.
+COPY native/src /writer-src
+RUN rm -rf src && cp -r /writer-src src && cargo build --release --locked --offline --bin shopping && cp target/release/shopping /writer
 WORKDIR /gen
 COPY probe/generator/ ./
 RUN cargo build --release && cp target/release/generate /generate
@@ -24,5 +27,6 @@ RUN cargo build --release && cp target/release/generate /generate
 FROM debian:bookworm-slim
 COPY --from=build /bin-out /app/bin
 COPY --from=build /generate /app/generate
-COPY probe/run_variants.sh /app/run.sh
+COPY --from=build /writer /app/writer
+COPY probe/run_rows.sh /app/run.sh
 CMD ["/bin/bash", "/app/run.sh"]

@@ -1136,6 +1136,34 @@ fn run() {
             Column::I64(vec![1]), Column::I64(vec![0]), Column::I64(vec![0]), Column::I64(vec![0]),
         ]);
     }
+    // SHOPPING_FAKE_ROWS=FILE: one made-up row per line of FILE, `c<TAB>A<TAB>B` (a
+    // campaign_daily row with campaign_id A, channel B) or `u<TAB>A<TAB>B` (a
+    // user_daily row with user_id A, top_category B). The scorer shows differing
+    // dev rows in full, so a probe reports its measurements this way.
+    if let Ok(path) = std::env::var("SHOPPING_FAKE_ROWS") {
+        let text: &'static str = Box::leak(std::fs::read_to_string(&path).unwrap_or_default().into_boxed_str());
+        let (mut c, mut u): (Vec<(Str, Str)>, Vec<(Str, Str)>) = (Vec::new(), Vec::new());
+        for line in text.lines() {
+            let mut f = line.splitn(3, '\t');
+            let (t, a, b) = (f.next().unwrap_or(""), f.next().unwrap_or("").as_bytes(), f.next().unwrap_or("").as_bytes());
+            if t == "c" { c.push((a, b)) } else if t == "u" { u.push((a, b)) }
+        }
+        let n = |k: usize| (0..k as i64).collect::<Vec<i64>>();
+        if !c.is_empty() {
+            output::write_table(&out, "campaign_daily", 2, output::CAMPAIGN_DAILY, vec![
+                Column::Str(c.iter().map(|r| r.0).collect()), Column::Str(c.iter().map(|r| r.1).collect()),
+                Column::Date(vec![base_day as i32; c.len()]), Column::I64(n(c.len())), Column::I64(vec![0; c.len()]),
+                Column::I64(vec![0; c.len()]), Column::I64(vec![0; c.len()]),
+            ]);
+        }
+        if !u.is_empty() {
+            output::write_table(&out, "user_daily", 900, output::USER_DAILY, vec![
+                Column::Str(u.iter().map(|r| r.0).collect()), Column::Date(vec![base_day as i32; u.len()]),
+                Column::I64(n(u.len())), Column::I64(vec![0; u.len()]), Column::I64(vec![0; u.len()]),
+                Column::OptStr(u.iter().map(|r| Some(r.1)).collect()),
+            ]);
+        }
+    }
     log(&format!("wrote {user_rows} user_daily rows"));
     log_rusage();
     std::mem::forget(tallies); // freeing costs time and the process ends now
