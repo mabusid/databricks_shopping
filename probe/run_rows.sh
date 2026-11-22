@@ -48,7 +48,7 @@ sys_b="thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1)|$(cat /sys/ke
 tests="none"
 [ -x /app/bin/tests-v3 ] && [ "$(uname -m)" = x86_64 ] && tests=$(timeout 60 /app/bin/tests-v3 2>&1 | grep -E "test result|panicked|FAILED" | head -3 | tr '\n' ' ')
 dev=""
-for b in $BINS; do r=$(run "dev $b" /app/bin/$b "$D"); dev="$dev $b:${r%% *} $(echo "$r" | grep -o 'ck[0-9a-f]*')"; done
+while read -r b bin envs; do r=$(run "dev $b" /app/bin/$bin "$D" $envs); dev="$dev $b:${r%% *}$(echo "$r" | grep -o ' ck[0-9a-f]*' | head -1)"; done < "$CONFIGS"
 
 t=$EPOCHREALTIME
 timeout 60 /app/generate --seed 1 --events "$EV20" --clicks $((EV20 / 4)) --output "$S/g20" >/dev/null 2>&1
