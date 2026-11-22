@@ -21,7 +21,7 @@ run() { # run LABEL BIN DATA [VAR=VALUE...]: prints "wall stages"
   local label=$1 bin=$2 data=$3; shift 3
   rm -rf "$S/o"; mkdir -p "$S/o"
   local t=$EPOCHREALTIME
-  env "$@" SHOPPING_CHECKSUM=1 DATA_DIR="$data" OUTPUT_DIR="$S/o" timeout "${RUN_TIMEOUT:-30}" "$bin" > "$S/run.log" 2>&1
+  env "$@" SHOPPING_CHECKSUM=1 DATA_DIR="$data" OUTPUT_DIR="$S/o" timeout "${RUN_TIMEOUT:-30}" "$bin" > "$S/run.log" 2>&1 < /dev/null
   local rc=$?
   local w=$(awk "BEGIN{printf \"%.3f\", $EPOCHREALTIME - $t}")
   echo "[$label] exit $rc wall $w" >> "$LOG"; cat "$S/run.log" >> "$LOG"
