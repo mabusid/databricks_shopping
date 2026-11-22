@@ -47,14 +47,104 @@ pub fn ts_ms(s: &[u8]) -> i64 {
     let n = s.len();
     // An F1/F2 string has '-' at 4, so it can't be digits only: decide by shape first.
     if (n == 20 || n == 25) && s[4] == b'-' {
+        return iso_swar(s);
+    }
+    if n == 13 {
+        return f3_13(s); // the usual F3 length (2001 to 2286)
+    }
+    digits_value(s, 18).unwrap_or(BAD)
+}
+
+/// The same as `ts_ms`, with the plain (reference) parsers; tests compare the two.
+#[cfg(test)]
+pub fn ts_ms_ref(s: &[u8]) -> i64 {
+    let n = s.len();
+    if (n == 20 || n == 25) && s[4] == b'-' {
         return iso_ms(s).unwrap_or(BAD);
     }
     digits_value(s, 18).unwrap_or(BAD)
 }
 
+#[inline(always)]
+fn load8(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+/// 0 if all 8 bytes are ASCII digits, else non-zero (exact: a carry or borrow
+/// between bytes only starts at a byte that is itself flagged).
+#[inline(always)]
+fn non_digits(x: u64) -> u64 {
+    (x.wrapping_sub(0x3030_3030_3030_3030) | x.wrapping_add(0x4646_4646_4646_4646)) & 0x8080_8080_8080_8080
+}
+
+/// The value of 8 ASCII digits, the first in the lowest byte (Lemire's SWAR method).
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let x = x.wrapping_sub(0x3030_3030_3030_3030);
+    let x = x.wrapping_mul(10).wrapping_add(x >> 8); // byte 2k: two-digit pair k
+    ((x & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        .wrapping_add(((x >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32
+}
+
+/// F3 with exactly 13 characters: digits only, any value (leading zeros included).
+#[inline(always)]
+fn f3_13(s: &[u8]) -> i64 {
+    let (a, b) = (load8(s, 0), load8(s, 5)); // bytes 0..8 and 5..13
+    if non_digits(a) | non_digits(b) != 0 {
+        return BAD;
+    }
+    (parse8(a) * 100_000 + parse8(b) % 100_000) as i64
+}
+
+/// F1 or F2 (length 20 or 25) with word-at-a-time loads: every separator,
+/// digit and range check folded into one flag. Same results as `iso_ms`.
+#[inline(always)]
+fn iso_swar(s: &[u8]) -> i64 {
+    // a: "YYYY-MM-" (bytes 0..8), b: "DDTHH:MM" (8..16), c: "H:MM:SSZ" (12..20).
+    let (a, b, c) = (load8(s, 0), load8(s, 8), load8(s, 12));
+    const SEP_A: u64 = 0xFF00_00FF_0000_0000; // bytes 4, 7
+    const SEP_B: u64 = 0x0000_FF00_00FF_0000; // bytes 10, 13
+    const SEP_C: u64 = 0x0000_00FF_0000_0000; // byte 16 (byte 4 of c)
+    let mut bad = ((a & SEP_A) != 0x2D00_002D_0000_0000) | ((b & SEP_B) != 0x0000_3A00_0054_0000) | ((c & SEP_C) != 0x0000_003A_0000_0000);
+    // Separators replaced by '0', so each word is digits only when the stamp is well formed.
+    let ad = (a & !SEP_A) | 0x3000_0030_0000_0000;
+    let bd = (b & !SEP_B) | 0x0000_3000_0030_0000;
+    let cd = (c & 0x00FF_FF00_0000_0000) | 0x3000_0030_3030_3030; // seconds at bytes 5, 6
+    bad |= (non_digits(ad) | non_digits(bd) | non_digits(cd)) != 0;
+    let pairs = |x: u64| {
+        let x = x.wrapping_sub(0x3030_3030_3030_3030);
+        x.wrapping_mul(10).wrapping_add(x >> 8) // byte k: digit k * 10 + digit k+1
+    };
+    let (pa, pb, pc) = (pairs(ad), pairs(bd), pairs(cd));
+    let byte = |x: u64, k: u32| ((x >> (8 * k)) & 0xFF) as i64;
+    let year = byte(pa, 0) * 100 + byte(pa, 2);
+    let (month, day, hour, minute, second) = (byte(pa, 5), byte(pb, 0), byte(pb, 3), byte(pb, 6), byte(pc, 5));
+    bad |= !(1..=12).contains(&month) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59);
+    let offset_s = if s.len() == 20 {
+        bad |= s[19] != b'Z';
+        0
+    } else {
+        // e: "SS+HH:MM" (bytes 17..25): sign at 2, hours at 3-4, ':' at 5, minutes at 6-7.
+        let e = load8(s, 17);
+        let sign = s[19];
+        bad |= ((e >> 40) & 0xFF) != b':' as u64;
+        let ed = (e & 0xFFFF_00FF_FF00_0000) | 0x0000_3000_0030_3030;
+        bad |= non_digits(ed) != 0 || (sign != b'+') & (sign != b'-');
+        let pe = pairs(ed);
+        let (oh, om) = (byte(pe, 3), byte(pe, 6));
+        bad |= (oh > 23) | (om > 59);
+        (if sign == b'-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
+    };
+    if bad || day > days_in_month(year, month) {
+        return BAD;
+    }
+    (days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset_s) * 1000
+}
+
 /// F1 or F2 (length 20 or 25). Every check is folded into one flag, so there
 /// is a single branch instead of one per digit.
-#[inline]
+#[cfg(test)]
 fn iso_ms(s: &[u8]) -> Option<i64> {
     let n = s.len();
     let b: &[u8; 20] = s[..20].try_into().ok()?;
@@ -113,6 +203,33 @@ mod tests {
         }
         assert_eq!(ts_ms(b"2028-02-29T00:00:00Z"), days_from_civil(2028, 2, 29) * 86_400_000);
         assert_eq!(ts_ms(b"1234567890123456789012"), BAD); // 22 significant digits
+    }
+
+    /// The word-at-a-time parsers give exactly what the plain ones give.
+    #[test]
+    fn swar_equals_reference() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = |m: u64| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x % m };
+        let alphabet = b"0123456789-:TZ+ zt.\r\xff/";
+        let mut checked = 0;
+        for i in 0..1_500_000u64 {
+            // A valid stamp of a random form and date, then 0-3 random byte edits.
+            let (y, mo, d) = (rnd(10_000), 1 + rnd(13), 1 + rnd(31));
+            let (h, mi, se) = (rnd(25), rnd(61), rnd(61));
+            let mut v: Vec<u8> = match i % 4 {
+                0 | 1 => format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z").into_bytes(),
+                2 => format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}{}{:02}:{:02}",
+                             if rnd(2) == 0 { '+' } else { '-' }, rnd(26), rnd(62)).into_bytes(),
+                _ => format!("{:013}", rnd(10_000_000_000_000)).into_bytes(),
+            };
+            for _ in 0..rnd(4) {
+                let k = rnd(v.len() as u64) as usize;
+                v[k] = alphabet[rnd(alphabet.len() as u64) as usize];
+            }
+            assert_eq!(ts_ms(&v), ts_ms_ref(&v), "{:?}", String::from_utf8_lossy(&v));
+            checked += (ts_ms(&v) != BAD) as u32;
+        }
+        assert!(checked > 100_000, "too few valid stamps: {checked}");
     }
 
     #[test]
