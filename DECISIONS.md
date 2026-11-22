@@ -22,7 +22,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Each probe uses one of the 2 slots an hour and scores nothing
   - `probe/Dockerfile` replaces the root Dockerfile only on a `probe` branch; main keeps building the real pipeline. `SHOPPING_PROBE` and `SHOPPING_FAKE_ROW` are off unless set
-- **Result:** pending (probe #1)
+- **Result:** Probe #1 (`889fc97`) failed the dev check as planned, but the scorer showed only the differing row, not our logs. Fix: probes write their measurements as text in made-up rows (`SHOPPING_FAKE_ROWS`, `probe/run_rows.sh`), which the scorer shows in full
 
 ## Experiment: 1024 buckets for large inputs, with block lists
 - **Context:** At 20M events, 256 buckets mean ~78k events per dedup table (~1.25 MB), beyond a Xeon core's 1 MB L2. Attempt #6 tried 2048 buckets with growing `Vec`s and lost ~0.06 s, mostly from scattering into fresh, pre-reserved memory. Block lists (#13) have since made the scatter cheap
