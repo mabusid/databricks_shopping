@@ -47,6 +47,8 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
    - Attempt #2: Polars memory cuts (28.4511 s)
    - Rewrite in Rust (`native/`): matches the dev answer, 36/36 fixtures, and the Polars output on 13 generated datasets
    - Attempts #3–#9: Rust speed-ups, 5.9099 → 2.8037 s (see SCORES.md and DECISIONS.md)
+   - Branch `lean` (attempt #16 candidate): 24-byte records in a lock-free arena, hashbrown tag fix, own Parquet writer, two-phase scanner, huge-page link table (DECISIONS.md, "Lean data path, round 1"). Linux proxy: 0.227 -> 0.153 s (min of 12)
+   - Probe #5 (branch `probe5`): the lean build on the scorer (default, 4 KB pages, 512 buckets) vs the old build at 20M, and lean at 60M
    - Next: the plan below
 
 ## Plan toward < 0.4 s (from 2.8037 s, attempt #9)

@@ -955,6 +955,9 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
 
 /// Close a user_daily row: top_category is the highest spend, ties to the byte-wise smallest name.
 fn finish_row(mut row: UserRow, spend: &mut [i64], cx: &Context) -> UserRow {
+    if row.revenue == 0 {
+        return row; // no purchase: no top category, and nothing was added to `spend`
+    }
     let mut best = 0;
     for &c in &cx.category_order {
         if spend[c as usize] > best {
