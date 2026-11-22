@@ -8,7 +8,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python
-BIN=native/target/release/shopping
+BIN=${BIN:-native/target/release/shopping}  # BIN=path tests another build
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail=0

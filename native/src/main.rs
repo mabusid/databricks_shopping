@@ -28,8 +28,7 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 30 * 60 * 1000;
-/// log2 of the number of hash buckets, set once from the input size so each
-/// bucket's tables stay small enough for a core's L2 cache (~16k events).
+/// log2 of the number of hash buckets (256), set once at start.
 static BUCKET_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
 const CHUNK_BYTES: usize = 2 << 20;
 
@@ -589,10 +588,10 @@ fn run() {
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
     let event_bytes: usize = event_chunks.iter().map(|c| c.len()).sum();
-    // ~16k events per bucket (at ~90 bytes a line), between 256 and 4096 buckets.
-    let bits = (event_bytes / 90 / 16_384).max(1).next_power_of_two().trailing_zeros().clamp(8, 12);
-    // SHOPPING_BUCKET_BITS overrides it: only for testing other bucket counts.
-    let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(bits);
+    // 256 buckets. Scaling them with the input (2048 at 20M, to keep each dedup
+    // table in L2) made attempt #6 slower: the wider scatter while parsing cost
+    // more. SHOPPING_BUCKET_BITS overrides it, only for testing other counts.
+    let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(8);
     BUCKET_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
     let (nb, threads) = (buckets(), rayon::current_num_threads());
     // Bucket lists are kept per worker thread, not per chunk, so their number

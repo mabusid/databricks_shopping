@@ -13,6 +13,17 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Back to 256 buckets
+- **Context:** Attempt #6 scaled buckets with the input (2048 at 20M) and was slower, 3.4492 → 3.5092 s. The scorer is consistent (the two Polars runs were 0.01 s apart), so the loss is real
+- **Options:** A) A fixed 256 buckets, keeping round 3's per-thread lists and quote-counting scanner. B) Try 512/1024
+- **Chose:** A. 256 is the count attempt #5 already measured. B would need several submissions to tune
+- **Pros:**
+  - Smaller scatter (256 lists per thread fit the L1 cache)
+- **Cons / risks:**
+  - Dedup tables at 20M (~78k events) exceed a Xeon's L2 again
+  - `SHOPPING_BUCKET_BITS` still lets tests force other counts
+- **Result:** — (attempt #8 pending)
+
 ## Person identity: 128-bit name hash instead of byte comparison
 - **Context:** Telling people apart compared their names byte by byte. For one-ID people the bytes sit in each event's own line, scattered across the input, so most comparisons and linked-ID lookups read memory that isn't in cache; on a Xeon with ~1 MB L2 per core that likely costs a trip to main memory per event
 - **Options:** A) Identify a person by two independent 64-bit hashes of the name (foldhash fast and quality variants, different seeds) and never read the name. B) Keep exact byte comparison
@@ -25,7 +36,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Not exact in principle: two different names sharing both hashes would merge two people. For a few million names that is about 1 in 10^26 per run, far below hardware error rates
   - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds and at 2048 buckets
-- **Result:** — (attempt #7 pending)
+- **Result:** Attempt #7: 3.5092 → 3.2035 s
 
 ## Rust speed-ups, round 3: cache-sized buckets, per-thread lists
 - **Context:** Attempt #5 scored 3.4492 s. This Mac (M1: 12 MB L2 on the fast cores) holds all our tables in cache at 3M events, but a scorer Xeon has ~1 MB L2 per core. At 20M, 256 buckets mean ~78k events per dedup table (~1.4 MB), over that limit
