@@ -519,7 +519,11 @@ impl Links {
 ///   4. build each part's lookup table.
 fn person_names(links_dir: &Path) -> Links {
     use std::sync::atomic::{AtomicU32, Ordering::{AcqRel, Acquire, Relaxed}};
-    let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, CHUNK_BYTES)
+    let lt = Instant::now();
+    let lt_on = std::env::var("SHOPPING_LINK_TIMES").is_ok();
+    let lmark = |what: &str| if lt_on { eprintln!("    links {:.4}s {what}", lt.elapsed().as_secs_f64()) };
+    // Small chunks: the links are only ~1% of the input, and every thread should get some.
+    let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, 256 << 10)
         .par_iter()
         .flat_map_iter(|&chunk| {
             let mut pairs = Vec::new();
@@ -535,6 +539,7 @@ fn person_names(links_dir: &Path) -> Links {
         .collect();
     let side = |o: u32| -> Str { let (a, b) = pairs[(o / 2) as usize]; if o % 2 == 0 { a } else { b } };
 
+    lmark("parse");
     // 1. Each occurrence o = 2 * pair + side goes to its ID's part; each part numbers its IDs.
     const CHUNK: usize = 4096;
     let threads = rayon::current_num_threads();
@@ -571,6 +576,7 @@ fn person_names(links_dir: &Path) -> Links {
             (keys, first, numbers)
         })
         .collect();
+    lmark("number");
     let mut offset = vec![0u32; LINK_PARTS + 1];
     for p in 0..LINK_PARTS {
         offset[p + 1] = offset[p] + numbered[p].0.len() as u32;
@@ -588,6 +594,7 @@ fn person_names(links_dir: &Path) -> Links {
         .collect::<Vec<_>>()
         .concat();
 
+    lmark("gather");
     // 2. Union-find.
     let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
@@ -618,6 +625,7 @@ fn person_names(links_dir: &Path) -> Links {
     });
     let roots: Vec<u32> = (0..n as u32).into_par_iter().map(|i| find(&parent, i)).collect();
 
+    lmark("union");
     // 3. Each person's byte-wise smallest ID (distinct IDs never have equal bytes).
     const NONE: u32 = u32::MAX;
     let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NONE)).collect();
@@ -632,6 +640,7 @@ fn person_names(links_dir: &Path) -> Links {
         }
     });
 
+    lmark("min-name");
     // 4. The lookup tables.
     let slots: Vec<Vec<LinkSlot>> = (0..LINK_PARTS)
         .into_par_iter()
@@ -651,6 +660,7 @@ fn person_names(links_dir: &Path) -> Links {
             LinkPart::build(&real)
         })
         .collect();
+    lmark("tables");
     // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
     let bits = (n * 8).max(1 << 16).next_power_of_two();
     let mut links = Links { parts, zero, bloom: Vec::new(), bloom_mask: (bits / 512 - 1) as u64 };
@@ -664,6 +674,7 @@ fn person_names(links_dir: &Path) -> Links {
         }
     });
     links.bloom = words.into_iter().map(|w| w.into_inner()).collect();
+    lmark("bloom");
     links
 }
 
@@ -961,7 +972,17 @@ static WR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 
 fn run() {
     let t0 = Instant::now();
-    let log = |what: &str| eprintln!("{:8.3}s  {what}", t0.elapsed().as_secs_f64());
+    let log = |what: &str| {
+        let rss = if std::env::var("SHOPPING_RSS").is_ok() {
+            // SAFETY: getrusage only writes the struct it is given.
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            format!("  [maxrss {} MB]", if cfg!(target_os = "macos") { u.ru_maxrss / 1_000_000 } else { u.ru_maxrss / 1000 })
+        } else {
+            String::new()
+        };
+        eprintln!("{:8.3}s  {what}{rss}", t0.elapsed().as_secs_f64())
+    };
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
 
@@ -972,37 +993,40 @@ fn run() {
     let days = ((end - 1).div_euclid(DAY) - base_day + 1) as usize;
 
     // Rule 7: categories from products.csv; a product not in it is `unknown`.
-    let products = input::small_table::<2>(&data.join("products.csv"));
-    let mut category_names: Vec<Str> = Vec::new();
-    let mut category_index: Map<Str, u16> = Map::with_hasher(hasher());
-    let mut product_category: Map<Str, u16> = Map::with_capacity_and_hasher(products.len(), hasher());
-    for [product, category] in &products {
-        let c = *category_index.entry(category).or_insert_with(|| {
-            category_names.push(category);
-            (category_names.len() - 1) as u16
-        });
-        product_category.entry(product).or_insert(c);
-    }
-    let unknown = category_names.len() as u16;
-    category_names.push(b"unknown");
-    assert!(category_names.len() <= 128, "categories are stored in 7 bits");
-    let mut category_order: Vec<u16> = (0..category_names.len() as u16).collect();
-    category_order.sort_by_key(|&c| category_names[c as usize]);
-
-    let campaign_rows = input::small_table::<2>(&data.join("campaigns.csv"));
-    let mut campaign_index: Map<Str, u32> = Map::with_capacity_and_hasher(campaign_rows.len(), hasher());
-    let mut campaign_ids: Vec<Str> = Vec::new();
-    let mut channels: Vec<Str> = Vec::new();
-    for [campaign, channel] in &campaign_rows {
-        if let Entry::Vacant(e) = campaign_index.entry(campaign) {
-            e.insert(campaign_ids.len() as u32);
-            campaign_ids.push(campaign);
-            channels.push(channel);
+    // The small tables are read while the linked IDs are built.
+    let (small, links) = rayon::join(|| {
+        let products = input::small_table::<2>(&data.join("products.csv"));
+        let mut category_names: Vec<Str> = Vec::new();
+        let mut category_index: Map<Str, u16> = Map::with_hasher(hasher());
+        let mut product_category: Map<Str, u16> = Map::with_capacity_and_hasher(products.len(), hasher());
+        for [product, category] in &products {
+            let c = *category_index.entry(category).or_insert_with(|| {
+                category_names.push(category);
+                (category_names.len() - 1) as u16
+            });
+            product_category.entry(product).or_insert(c);
         }
-    }
-    let campaigns = campaign_ids.len();
+        let unknown = category_names.len() as u16;
+        category_names.push(b"unknown");
+        assert!(category_names.len() <= 128, "categories are stored in 7 bits");
+        let mut category_order: Vec<u16> = (0..category_names.len() as u16).collect();
+        category_order.sort_by_key(|&c| category_names[c as usize]);
 
-    let links = person_names(&data.join("links"));
+        let campaign_rows = input::small_table::<2>(&data.join("campaigns.csv"));
+        let mut campaign_index: Map<Str, u32> = Map::with_capacity_and_hasher(campaign_rows.len(), hasher());
+        let mut campaign_ids: Vec<Str> = Vec::new();
+        let mut channels: Vec<Str> = Vec::new();
+        for [campaign, channel] in &campaign_rows {
+            if let Entry::Vacant(e) = campaign_index.entry(campaign) {
+                e.insert(campaign_ids.len() as u32);
+                campaign_ids.push(campaign);
+                channels.push(channel);
+            }
+        }
+        let campaigns = campaign_ids.len();
+        (category_names, product_category, unknown, category_order, campaign_index, campaign_ids, channels, campaigns)
+    }, || person_names(&data.join("links")));
+    let (category_names, product_category, unknown, category_order, campaign_index, campaign_ids, channels, campaigns) = small;
     log("small tables and linked IDs");
 
     // Event chunks, and the bucket count.
@@ -1029,7 +1053,8 @@ fn run() {
     // Block memory: an event line (46+ bytes) leaves at most 48 bytes of records, a
     // click line (21+ bytes) 24, plus every list's partly filled last block.
     let click_bytes: usize = click_chunks.iter().map(|c| c.len()).sum();
-    blocks::init(event_bytes * 11 / 10 + click_bytes * 12 / 10 + 3 * buckets() * threads * blocks::BLOCK_BYTES + (256 << 20));
+    // Plus each thread's partly used 1 MB chunk.
+    blocks::init(event_bytes * 11 / 10 + click_bytes * 12 / 10 + 3 * buckets() * threads * blocks::BLOCK_BYTES + (threads << 20) + (256 << 20));
     let work: Vec<(bool, &'static [u8])> =
         event_chunks.iter().map(|&c| (false, c)).chain(click_chunks.iter().map(|&c| (true, c))).collect();
     let lists: Vec<ParseLists> = per_thread(threads, ParseLists::new, |acc| {

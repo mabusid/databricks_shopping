@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// Bytes per block. Every element type stored here is `Copy`, at most 64-byte aligned.
 /// Small, because every list's last block is partly empty and there are
 /// thousands of lists (buckets x threads x kinds).
-pub const BLOCK_BYTES: usize = 16 << 10;
+pub const BLOCK_BYTES: usize = 4 << 10;
+/// Each thread takes the arena in chunks of this many bytes and cuts its blocks
+/// from them, so its blocks share its own huge pages and the shared counter is rare.
+const CHUNK_BYTES: usize = 1 << 20;
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -49,11 +52,24 @@ pub fn init(bytes: usize) {
     BASE.store(base, Relaxed);
 }
 
+thread_local! {
+    /// This thread's current chunk: (next free address, end).
+    static CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 #[inline]
 fn take_block() -> *mut u8 {
-    let off = NEXT.fetch_add(BLOCK_BYTES, Relaxed);
-    assert!(off + BLOCK_BYTES <= ARENA_BYTES.load(Relaxed), "arena full");
-    (BASE.load(Relaxed) + off) as *mut u8
+    CHUNK.with(|c| {
+        let (mut next, mut end) = c.get();
+        if next == end {
+            let off = NEXT.fetch_add(CHUNK_BYTES, Relaxed);
+            assert!(off + CHUNK_BYTES <= ARENA_BYTES.load(Relaxed), "arena full");
+            next = BASE.load(Relaxed) + off;
+            end = next + CHUNK_BYTES;
+        }
+        c.set((next + BLOCK_BYTES, end));
+        next as *mut u8
+    })
 }
 
 /// A 32-bit name for an element in the arena (8-byte aligned, below 32 GB).

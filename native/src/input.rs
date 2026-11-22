@@ -282,7 +282,7 @@ fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
 /// and ends with a quote: any other quote makes the count too high.
 #[inline]
 #[allow(unused_assignments)] // the last end_line! resets state nobody reads
-pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(Option<[&'static [u8]; N]>)) {
+pub fn for_each_record_fused<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(Option<[&'static [u8]; N]>)) {
     let n = chunk.len();
     let mut commas = [0usize; N]; // positions of the line's first N-1 commas
     let mut nc = 0usize; // commas in the current line
@@ -397,6 +397,131 @@ pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(O
     }
 }
 
+/// Bytes per window of the two-phase scanner: its position arrays stay in cache.
+const WINDOW: usize = 64 << 10;
+
+thread_local! {
+    /// The two-phase scanner's arrays, reused: comma positions, and per newline
+    /// (position, commas before it, quotes before it), all counted from the window start.
+    static SCAN: std::cell::RefCell<(Vec<u32>, Vec<[u32; 3]>)> =
+        std::cell::RefCell::new((Vec::with_capacity(WINDOW / 2 + 64), Vec::with_capacity(WINDOW / 4 + 64)));
+}
+
+/// The same as `for_each_record_fused`, in two phases per window of input:
+///   1. SIMD masks per 64-byte block; every comma position is written out
+///      (8 at a time, no data-dependent branch), and every newline with the
+///      number of commas and quotes before it;
+///   2. one tight loop over the lines: a line is well formed when it has
+///      exactly N-1 commas and its quotes are exactly the field-wrapping ones.
+#[inline]
+pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(Option<[&'static [u8]; N]>)) {
+    let n = chunk.len();
+    if n == 0 {
+        return;
+    }
+    SCAN.with(|scan| {
+        let mut scan = scan.borrow_mut();
+        let (commas, lines) = &mut *scan;
+        let last = n - 1;
+        let mut ws = 0; // window start: always a line start
+        while ws < n {
+            let mut we = (ws + WINDOW).min(n);
+            loop {
+                commas.clear();
+                lines.clear();
+                let (mut cbase, mut qbase) = (0u32, 0u32);
+                let mut i = ws;
+                while i < we {
+                    let (c, q, nl) = if i + 64 <= we {
+                        masks64(chunk[i..i + 64].try_into().unwrap())
+                    } else {
+                        let mut tail = [0u8; 64]; // zeros are not structural
+                        tail[..we - i].copy_from_slice(&chunk[i..we]);
+                        masks64(&tail)
+                    };
+                    // Comma positions, 8 at a time (extra writes land past the end and are ignored).
+                    let cnt = c.count_ones() as usize;
+                    let at = commas.len();
+                    commas.reserve(cnt + 8);
+                    // SAFETY: capacity for at + cnt + 8 elements was just reserved.
+                    unsafe {
+                        let p = commas.as_mut_ptr().add(at);
+                        let mut m = c;
+                        let mut k = 0;
+                        loop {
+                            for j in 0..8 {
+                                *p.add(k + j) = (i - ws) as u32 + m.trailing_zeros();
+                                m &= m.wrapping_sub(1);
+                            }
+                            k += 8;
+                            if k >= cnt {
+                                break;
+                            }
+                        }
+                        commas.set_len(at + cnt);
+                    }
+                    let mut m = nl;
+                    while m != 0 {
+                        let k = m.trailing_zeros();
+                        let below = (1u64 << k) - 1;
+                        lines.push([(i - ws) as u32 + k, cbase + (c & below).count_ones(), qbase + (q & below).count_ones()]);
+                        m &= m - 1;
+                    }
+                    cbase += cnt as u32;
+                    qbase += q.count_ones();
+                    i += 64;
+                }
+                // A window must hold a whole line unless it reaches the chunk's end.
+                if lines.is_empty() && we < n {
+                    we = n;
+                    continue;
+                }
+                // The final line of the chunk has no newline: close it at the end.
+                if we == n {
+                    let tail_start = lines.last().map_or(ws, |l| ws + l[0] as usize + 1);
+                    if tail_start < n {
+                        lines.push([(n - ws) as u32, cbase, qbase]);
+                    }
+                }
+                break;
+            }
+            let (mut line_start, mut c0, mut q0) = (ws, 0u32, 0u32);
+            for &[e, ce, qe] in lines.iter() {
+                let end = ws + e as usize;
+                if (ce - c0) as usize + 1 == N {
+                    let quotes = qe - q0;
+                    let mut out: [&'static [u8]; N] = [&[]; N];
+                    let mut s = line_start;
+                    let mut boundary = 0u32;
+                    for k in 0..N {
+                        // SAFETY: c0 + k < ce <= commas.len().
+                        let e = if k + 1 < N { ws + unsafe { *commas.get_unchecked(c0 as usize + k) } as usize } else { end };
+                        // Branchless, as in the fused scanner: clamped reads of the
+                        // field's first and last byte, one quote stripped at each end
+                        // only if both are quotes and the field has at least 2 bytes.
+                        // SAFETY: both indices are clamped to 0..=last.
+                        let (first, final_) = unsafe {
+                            (*chunk.get_unchecked(s.min(last)), *chunk.get_unchecked(e.max(1).wrapping_sub(1).min(last)))
+                        };
+                        let q = ((quotes != 0) & (e >= s + 2) & (first == b'"') & (final_ == b'"')) as usize;
+                        // SAFETY: line_start <= s <= e <= n, so s + q <= e - q.
+                        out[k] = unsafe { chunk.get_unchecked(s + q..e - q) };
+                        boundary += 2 * q as u32;
+                        s = e + 1;
+                    }
+                    f(if boundary == quotes { Some(out) } else { None });
+                } else {
+                    f(None); // wrong number of fields (an empty line has 1)
+                }
+                line_start = end + 1;
+                c0 = ce;
+                q0 = qe;
+            }
+            ws = line_start.min(n);
+        }
+    });
+}
+
 /// Every well-formed line of a small, clean file (products.csv, campaigns.csv).
 pub fn small_table<const N: usize>(path: &Path) -> Vec<[&'static [u8]; N]> {
     let mut rows = Vec::new();
@@ -453,8 +578,49 @@ mod tests {
         v
     }
 
+    fn fused_way<const N: usize>(chunk: &'static [u8]) -> Vec<Option<[&'static [u8]; N]>> {
+        let mut v = Vec::new();
+        for_each_record_fused::<N>(chunk, |r| v.push(r));
+        v
+    }
+
     fn check<const N: usize>(chunk: &'static [u8]) {
         assert_eq!(old_way::<N>(chunk), new_way::<N>(chunk), "N={N} chunk={:?}", String::from_utf8_lossy(chunk));
+        assert_eq!(old_way::<N>(chunk), fused_way::<N>(chunk), "N={N} chunk={:?}", String::from_utf8_lossy(chunk));
+    }
+
+    /// Chunks larger than a window, lines across window ends, and a line longer than a window.
+    #[test]
+    fn windows() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |m: u64| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x % m };
+        for round in 0..12 {
+            let mut buf = Vec::new();
+            let target = [1usize << 16, (1 << 16) - 1, (1 << 16) + 1, 200_000, 300_000, 140_000][round % 6];
+            while buf.len() < target {
+                let fields = 1 + rnd(9) as usize;
+                for k in 0..fields {
+                    if k > 0 { buf.push(b','); }
+                    let len = rnd(12) as usize;
+                    let quoted = rnd(5) == 0;
+                    if quoted { buf.push(b'"'); }
+                    for _ in 0..len { buf.push(b"ab \r\"0"[rnd(6) as usize]); }
+                    if quoted { buf.push(b'"'); }
+                }
+                if rnd(50) != 0 { buf.push(b'\n'); }
+            }
+            if round == 7 {
+                // one line longer than a window
+                let at = buf.len() / 2;
+                let long: Vec<u8> = (0..100_000).map(|i| if i % 9 == 0 { b',' } else { b'z' }).collect();
+                buf.splice(at..at, long);
+            }
+            if round % 2 == 1 { buf.pop(); } // sometimes no final newline
+            let s: &'static [u8] = Box::leak(buf.into_boxed_slice());
+            check::<2>(s);
+            check::<4>(s);
+            check::<7>(s);
+        }
     }
 
     #[test]
