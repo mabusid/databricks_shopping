@@ -135,98 +135,98 @@ fn eq_mask(w: u64, b: u8) -> u64 {
     !(((x & LOW7).wrapping_add(LOW7)) | x | LOW7)
 }
 
-/// Call `f(line, fields)` for every line of `chunk`: `fields` is Some if the
-/// line has exactly N fields, each fully quoted or quote-free (quotes removed),
-/// None if it is malformed. Same rules as `fields::<N>(line)`.
+/// Call `f(fields)` for every line of `chunk`: Some if the line has exactly N
+/// fields, each fully quoted or quote-free (quotes removed), None if it is
+/// malformed. Same rules as `fields::<N>(line)`.
+///
+/// Commas, newlines and quotes are found 8 bytes at a time with bitmasks.
+/// Commas are recorded; quotes are only counted. At the end of a line, the line
+/// is valid exactly when its quote count equals 2 for every field that starts
+/// and ends with a quote: any other quote makes the count too high.
 #[inline]
+#[allow(unused_assignments)] // the last end_line! resets state nobody reads
 pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(Option<[&'static [u8]; N]>)) {
     let n = chunk.len();
-    let mut out: [&'static [u8]; N] = [&[]; N];
-    let mut nf = 0usize; // fields closed so far in this line
-    let mut bad = false; // line already known malformed
-    let mut field_start = 0usize;
-    let mut q_count = 0u32; // quotes in the current field
-    let mut q_first = 0usize;
-    let mut q_last = 0usize;
+    let mut commas = [0usize; N]; // positions of the line's first N-1 commas
+    let mut nc = 0usize; // commas in the current line
+    let mut quotes = 0u32; // quotes in the current line
+    let mut line_start = 0usize;
 
-    // Close the field [field_start, end): check its quotes, store it.
-    macro_rules! close_field {
-        ($end:expr) => {{
-            let end = $end;
-            if !bad {
-                if nf >= N {
-                    bad = true;
-                } else {
-                    let mut s = field_start;
-                    let mut e = end;
-                    if q_count != 0 {
-                        if q_count == 2 && q_first == field_start && q_last + 1 == end && end - field_start >= 2 {
-                            s += 1;
-                            e -= 1;
-                        } else {
-                            bad = true;
-                        }
-                    }
-                    out[nf] = &chunk[s..e];
-                    nf += 1;
-                }
+    macro_rules! comma {
+        ($pos:expr) => {{
+            if nc < N - 1 {
+                commas[nc] = $pos;
             }
-            #[allow(unused_assignments)]
-            { q_count = 0; }
+            nc += 1;
         }};
     }
     macro_rules! end_line {
         ($end:expr) => {{
-            close_field!($end);
-            f(if !bad && nf == N { Some(out) } else { None });
-            nf = 0;
-            bad = false;
-            field_start = $end + 1;
-        }};
-    }
-    macro_rules! delim {
-        ($pos:expr, $byte:expr) => {{
-            let pos = $pos;
-            match $byte {
-                b',' => {
-                    close_field!(pos);
-                    field_start = pos + 1;
-                }
-                b'\n' => end_line!(pos),
-                _ => {
-                    // a quote
-                    if q_count == 0 {
-                        q_first = pos;
+            let end = $end;
+            if nc + 1 == N {
+                let mut out: [&'static [u8]; N] = [&[]; N];
+                let mut s = line_start;
+                let mut boundary = 0u32;
+                for k in 0..N {
+                    let e = if k + 1 < N { commas[k] } else { end };
+                    let (mut fs, mut fe) = (s, e);
+                    if quotes != 0 && e - s >= 2 && chunk[s] == b'"' && chunk[e - 1] == b'"' {
+                        fs += 1;
+                        fe -= 1;
+                        boundary += 2;
                     }
-                    q_last = pos;
-                    q_count += 1;
+                    out[k] = &chunk[fs..fe];
+                    s = e + 1;
                 }
+                f(if boundary == quotes { Some(out) } else { None });
+            } else {
+                f(None); // wrong number of fields (an empty line has 1)
             }
+            nc = 0;
+            quotes = 0;
+            line_start = end + 1;
         }};
     }
 
     let mut i = 0;
     while i + 8 <= n {
         let w = u64::from_le_bytes(chunk[i..i + 8].try_into().unwrap());
-        let mut m = eq_mask(w, b',') | eq_mask(w, b'\n') | eq_mask(w, b'"');
-        while m != 0 {
-            let k = (m.trailing_zeros() / 8) as usize;
-            delim!(i + k, chunk[i + k]);
-            m &= m - 1;
+        let mut c = eq_mask(w, b',');
+        let mut q = eq_mask(w, b'"');
+        let mut nl = eq_mask(w, b'\n');
+        while nl != 0 {
+            // Everything before this newline belongs to the current line.
+            let k = nl.trailing_zeros();
+            let below = (1u64 << k) - 1;
+            let mut cb = c & below;
+            while cb != 0 {
+                comma!(i + (cb.trailing_zeros() / 8) as usize);
+                cb &= cb - 1;
+            }
+            quotes += (q & below).count_ones();
+            c &= !below;
+            q &= !below;
+            end_line!(i + (k / 8) as usize);
+            nl &= nl - 1;
         }
+        while c != 0 {
+            comma!(i + (c.trailing_zeros() / 8) as usize);
+            c &= c - 1;
+        }
+        quotes += q.count_ones();
         i += 8;
     }
     while i < n {
-        let b = chunk[i];
-        if b == b',' || b == b'\n' || b == b'"' {
-            delim!(i, b);
+        match chunk[i] {
+            b',' => comma!(i),
+            b'"' => quotes += 1,
+            b'\n' => end_line!(i),
+            _ => {}
         }
         i += 1;
     }
-    if field_start < n || nf > 0 {
-        // a final line without '\n'
-        close_field!(n);
-        f(if !bad && nf == N { Some(out) } else { None });
+    if line_start < n {
+        end_line!(n); // a final line without '\n'
     }
 }
 

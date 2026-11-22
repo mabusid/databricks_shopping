@@ -28,7 +28,9 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: i64 = 30 * 60 * 1000;
-const BUCKETS: usize = 256;
+/// log2 of the number of hash buckets, set once from the input size so each
+/// bucket's tables stay small enough for a core's L2 cache (~16k events).
+static BUCKET_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
 const CHUNK_BYTES: usize = 2 << 20;
 
 const VIEW: u8 = 0;
@@ -48,15 +50,29 @@ fn hash(key: Str) -> u64 {
     hasher().hash_one(key)
 }
 
-/// Each key is hashed once; the hash picks its bucket (top 8 bits: 256 buckets)
+/// Each key is hashed once; the hash's top bits pick its bucket
 /// and is reused in the bucket's hash table.
 #[inline]
 fn bucket(h: u64) -> usize {
-    (h >> 56) as usize
+    (h >> (64 - BUCKET_BITS.load(std::sync::atomic::Ordering::Relaxed))) as usize
+}
+
+fn buckets() -> usize {
+    1 << BUCKET_BITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run `work` with `acc()`, which gives the calling rayon worker its own
+/// accumulator (no other thread ever touches it, so the lock is never contended),
+/// and return all the accumulators.
+fn per_thread<A: Send>(threads: usize, new: impl Fn() -> A, work: impl for<'a> FnOnce(&'a (dyn Fn() -> std::sync::MutexGuard<'a, A> + Sync))) -> Vec<A> {
+    let accs: Vec<std::sync::Mutex<A>> = (0..threads).map(|_| std::sync::Mutex::new(new())).collect();
+    let acc = || accs[rayon::current_thread_index().unwrap_or(0) % threads].lock().unwrap();
+    work(&acc);
+    accs.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
 fn new_buckets<T>(capacity: usize) -> Vec<Vec<T>> {
-    (0..BUCKETS).map(|_| Vec::with_capacity(capacity)).collect()
+    (0..buckets()).map(|_| Vec::with_capacity(capacity)).collect()
 }
 
 /// One copy of an event, as parsed. `ok`: rules 3-4 hold for this copy. For a
@@ -550,25 +566,32 @@ fn run() {
     // Pass 1: parse every event copy, bucketed by event_id.
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
-    let copies: Vec<Vec<Vec<EventCopy>>> = event_chunks
-        .par_iter()
-        .map(|&chunk| {
-            let mut b = new_buckets(chunk.len() / 70 / BUCKETS * 5 / 4 + 8);
+    let event_bytes: usize = event_chunks.iter().map(|c| c.len()).sum();
+    // ~16k events per bucket (at ~90 bytes a line), between 256 and 4096 buckets.
+    let bits = (event_bytes / 90 / 16_384).max(1).next_power_of_two().trailing_zeros().clamp(8, 12);
+    // SHOPPING_BUCKET_BITS overrides it: only for testing other bucket counts.
+    let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(bits);
+    BUCKET_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
+    let (nb, threads) = (buckets(), rayon::current_num_threads());
+    // Bucket lists are kept per worker thread, not per chunk, so their number
+    // depends on the threads, not on the input size.
+    let copies: Vec<Vec<Vec<EventCopy>>> = per_thread(threads, || new_buckets(event_bytes / 80 / nb / threads + 16), |acc| {
+        event_chunks.par_iter().for_each(|&chunk| {
+            let mut b = acc();
             input::for_each_record::<7>(chunk, |rec| {
                 if let Some(c) = rec.and_then(|f| parse_event(f, &lookups)) {
                     b[bucket(c.h)].push(c);
                 }
             });
-            b
-        })
-        .collect();
+        });
+    });
     log("events parsed");
 
     // Pass 2: dedup before validation (each event_id's earliest copy, valid or
     // not), drop invalid events, re-bucket the survivors by person.
-    let events: Vec<Vec<Vec<Event>>> = (0..BUCKETS)
-        .into_par_iter()
-        .map(|bi| {
+    let events: Vec<Vec<Vec<Event>>> = per_thread(threads, || new_buckets(event_bytes / 90 / nb / threads + 16), |acc| {
+        (0..nb).into_par_iter().for_each(|bi| {
+            let mut b = acc();
             let n: usize = copies.iter().map(|c| c[bi].len()).sum();
             let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
             let mut kept: Vec<&EventCopy> = Vec::with_capacity(n);
@@ -586,15 +609,13 @@ fn run() {
                     }
                 }
             }
-            let mut b = new_buckets(n / BUCKETS + 8);
             for c in kept.into_iter().filter(|c| c.ok) {
                 b[bucket(c.hp)].push(Event {
                     person: c.person, hp: c.hp, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
                 });
             }
-            b
-        })
-        .collect();
+        });
+    });
     // Big tables are never freed: freeing costs time (madvise/munmap) and the process ends soon.
     std::mem::forget(copies);
     log("events deduped and validated");
@@ -602,10 +623,11 @@ fn run() {
     // Pass 3: clicks. Copies of a click are identical, so dedup can change
     // neither credit (same ts and click_id) nor assists (each campaign counts
     // once): it is skipped.
-    let clicks: Vec<Vec<Vec<Click>>> = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES)
-        .par_iter()
-        .map(|&chunk| {
-            let mut b = new_buckets(chunk.len() / 50 / BUCKETS * 5 / 4 + 8);
+    let click_chunks = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES);
+    let click_bytes: usize = click_chunks.iter().map(|c| c.len()).sum();
+    let clicks: Vec<Vec<Vec<Click>>> = per_thread(threads, || new_buckets(click_bytes / 45 / nb / threads + 16), |acc| {
+        click_chunks.par_iter().for_each(|&chunk| {
+            let mut b = acc();
             input::for_each_record::<4>(chunk, |rec| {
                 let Some([click_id, user_id, campaign, ts]) = rec else { return };
                 if click_id.is_empty() || user_id.is_empty() {
@@ -619,14 +641,13 @@ fn run() {
                 let (person, hp) = links.person_of(user_id);
                 b[bucket(hp)].push(Click { person, hp, ts, click_id, campaign });
             });
-            b
-        })
-        .collect();
+        });
+    });
     log("clicks parsed");
 
     // Pass 4: per person bucket.
     let cx = Context { base_day, days, campaigns, categories: category_names.len(), category_order };
-    let tally = (0..BUCKETS)
+    let tally = (0..nb)
         .into_par_iter()
         .fold(
             || Tally::new(campaigns, days),
