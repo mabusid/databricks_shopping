@@ -29,6 +29,10 @@ run() { # run LABEL BIN DATA [VAR=VALUE...]: prints "wall stages"
 }
 finish() { rm -rf "$O"/*; SHOPPING_FAKE_ROWS="$SUM" DATA_DIR="$D" OUTPUT_DIR="$O" /app/writer >/dev/null 2>&1; }
 BINS=$(ls /app/bin | grep -v '^tests')
+# Optional /app/configs: lines "LABEL BIN [VAR=VALUE...]" timed instead of one run per build.
+CONFIGS=/app/configs
+[ -f "$CONFIGS" ] || { for b in $BINS; do echo "$b $b"; done > "$S/configs"; CONFIGS=$S/configs; }
+LABELS=$(awk '{print $1}' "$CONFIGS")
 
 # A first dev output with one fake row, in case anything below dies.
 SHOPPING_FAKE_ROW=1 DATA_DIR="$D" OUTPUT_DIR="$O" /app/writer >/dev/null 2>&1
@@ -52,13 +56,13 @@ gen20="gen20 exit $? $(awk "BEGIN{printf \"%.1f\", $EPOCHREALTIME - $t}")s $(du 
 
 # 20M rounds, interleaved.
 declare -A walls best bestw
-for i in $(seq 1 $ROUNDS); do for b in $BINS; do
-  r=$(run "$b $i" /app/bin/$b "$S/g20"); w=${r%% *}; w=${w#w}
+for i in $(seq 1 $ROUNDS); do while read -r b bin envs; do
+  r=$(run "$b $i" /app/bin/$bin "$S/g20" $envs); w=${r%% *}; w=${w#w}
   walls[$b]="${walls[$b]} $w"
   if [ -z "${bestw[$b]}" ] || awk "BEGIN{exit !($w < ${bestw[$b]})}"; then bestw[$b]=$w; best[$b]="$r"; fi
-done; done
+done < "$CONFIGS"; done
 c1a="20M best of $ROUNDS:"; c1b="walls:"
-for b in $BINS; do c1a="$c1a | $b ${best[$b]}"; c1b="$c1b | $b${walls[$b]}"; done
+for b in $LABELS; do c1a="$c1a | $b ${best[$b]}"; c1b="$c1b | $b${walls[$b]}"; done
 row c "c1 $c1a" "c1b $c1b"
 row c "c2 $sys_a" "c2b $sys_b"
 row u "u1 tests: $tests" "u1b dev:$dev $gen20 (at $(el)s)"
