@@ -19,14 +19,19 @@ Score = container run time, start to exit. A nearly correct answer scores 0.
 - `rules/`: the official rules.md
 - `starter/`: the three official starters as zips, unchanged; the Polars one is copied to the root
 - `fixtures/`: the 36 edge-case fixtures
-- `pipeline/pipeline.py`: our pipeline; `scripts/`: the starter's run and diff scripts
+- `native/`: the pipeline as a Rust program; this is what the Dockerfile builds and runs
+- `pipeline/pipeline.py`: the Polars pipeline, kept as a second, checked implementation (commit `82a5c68` runs it); `scripts/`: the starter's run and diff scripts
 - `data/`: the dev data (gitignored); `dev-answer/`: its expected output (gitignored)
 - `tests/`: `oracle.py`, a slow plain-Python reading of the rules, and the checks built on it
 
 ## Test
 ```sh
-.venv/bin/python tests/check_steps.py fixtures/*/input data                          # each step vs the oracle
-.venv/bin/python scripts/run_fixtures.py fixtures -- .venv/bin/python pipeline/pipeline.py   # the 36 fixtures, no Docker
+cargo build --release --manifest-path native/Cargo.toml                              # build the Rust binary
+cargo test --release --manifest-path native/Cargo.toml                               # its unit tests
+.venv/bin/python scripts/run_fixtures.py fixtures -- native/target/release/shopping  # the 36 fixtures, no Docker
+DATA_DIR=data OUTPUT_DIR=out native/target/release/shopping && (cd scripts && ../.venv/bin/python compare.py ../out ../dev-answer)
+# The Rust vs Polars output on any generated dataset: run both into two folders, then scripts/compare.py A B
+.venv/bin/python tests/check_steps.py fixtures/*/input data                          # Polars, each step vs the oracle
 make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                       # the 36 fixtures in Docker
 ```
 
@@ -39,3 +44,5 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
 6. [x] Credit sessions to ad clicks, count assisting campaigns (both tables match the dev answer)
 7. [x] All 36 fixtures pass → first submission (attempt #1: 28.4397 s)
 8. [ ] Profile and optimize, one change per submission
+   - Attempt #2: Polars memory cuts (28.4511 s)
+   - Rewrite in Rust (`native/`): matches the dev answer, 36/36 fixtures, and the Polars output on 13 generated datasets

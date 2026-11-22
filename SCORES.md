@@ -12,3 +12,4 @@ Reference (track page, scorer version shopping-sessions-5): baseline 167.6152 s 
 | # | Date / time | Commit | Change tested | Fixtures | Local time (s) | Score (s) | Notes |
 |---|-------------|--------|---------------|----------|----------------|-----------|-------|
 | 1 | 2026-11-21 ~22:00 EST | `5bfaa0e` | First full pipeline, steps 3–6 (Polars) | 36/36 | 2.2 (1M dev, Mac); 4.6 (Docker arm64, 4 CPUs) | 28.4397 | Practice data, ~20M events. Baseline is 167.6152. Times 3 for 60M ≈ 85 s; untested 60M memory is the risk |
+| 2 | 2026-11-21 ~22:30 EST | `82a5c68` | Memory cuts: compact event copies, cheaper dedup, free tables early | 36/36 | 1.0 (1M dev, Mac); 2.3 (Docker arm64, 4 CPUs) | 28.4511 | No real change from #1: at 20M the Python/Polars engine itself sets the time. Projected 60M memory ~16.7 GB (Linux anon peak 1.07/1.32/1.60 GB at 1/2/3M) |

@@ -9,3 +9,7 @@ dev-answer/
 starter/
 generator/
 *.zip
+native/target/
+pipeline/
+tests/
+scripts/

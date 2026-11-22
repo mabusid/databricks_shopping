@@ -13,6 +13,19 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Engine: rewrite as a native Rust binary
+- **Context:** The leaderboard top is ~0.5 s on the ~20M practice set; we are at ~28 s with Polars, and halving our local time (attempt #2) did not move the score. Python + Polars start-up alone is ~0.3 s, so the top can't be reached from there
+- **Options:** A) One Rust binary that reads the files directly from memory. It parses lines with a parser written for our CSV rules, runs hash-partitioned passes (dedup by `event_id`, then group by person), and does sessions, credit and assists per person in plain loops. B) Keep tuning Polars (maybe 10–15 s at best). C) C++
+- **Chose:** A, because the user asked to work toward the top. Rust is installed, the generator is Rust, and crates (rayon, memmap2, parquet) cover the plumbing
+- **Pros:**
+  - Start-up in milliseconds, no dataframe overhead, and full control of memory
+  - Checked by the oracle, the 36 fixtures, the dev answer, and the Polars version on any generated data
+- **Cons / risks:**
+  - A large rewrite with the deadline at Sun 11:00 AM EST
+  - New code means new chances to be wrong, which scores 0
+  - Mitigation: the Polars commit `82a5c68` (28.4511 s, correct) stays the fallback for the final, and the Dockerfile switches only once the Rust version passes every check
+- **Result:** —
+
 ## Memory: compact event copies, cheaper dedup, free tables early
 - **Context:** The final uses ~60M events in 24 GB with no swap, and practice runs (~20M) can't show that. Peak memory footprint grew ~0.5 GB per 1M events (1M→3M, macOS), which projects to ~30 GB at 60M: out of memory, so no score
 - **Options:** A) Measure each stage and fix the biggest costs in place. B) Use integer codes for persons and campaigns throughout. C) Spill to `/scratch`
@@ -28,7 +41,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Still a projection from 3M on macOS, not a 60M measurement
   - Several small changes go in one submission, all aimed at memory
   - B is left in reserve. The assist join of runs × person-days (~1.25 rows per event) is the next-biggest cost
-- **Result:** — (attempt #2 pending)
+- **Result:** Attempt #2: 28.4511 s, no real change from #1 (28.4397). The memory headroom (projected 60M peak ~16.7 GB from Linux runs at 1–3M) was the goal
 
 ## Assists: count per day, don't list pairs
 - **Context:** The dev set has 181,032 sessions but 1,958,238 (session, campaign) assist pairs. At 60× the data that is likely over 100M pairs, more for whales, so listing pairs is too costly
