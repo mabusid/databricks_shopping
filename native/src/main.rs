@@ -50,6 +50,23 @@ fn hash(key: Str) -> u64 {
     hasher().hash_one(key)
 }
 
+/// A second, independent hash (foldhash's other variant, another seed).
+#[inline]
+fn hash2(key: Str) -> u64 {
+    foldhash::quality::FixedState::with_seed(0x9e37_79b9_7f4a_7c15).hash_one(key)
+}
+
+/// A person's identity: (hash, hash2) of their name, 128 bits. People are told
+/// apart by it without reading their names, which for one-ID people are scattered
+/// across the input. Two different names would share it about once in 10^26 runs
+/// (the user's decision; see DECISIONS.md).
+type PersonKey = (u64, u64);
+
+#[inline]
+fn key_of(name: Str) -> PersonKey {
+    (hash(name), hash2(name))
+}
+
 /// Each key is hashed once; the hash's top bits pick its bucket
 /// and is reused in the bucket's hash table.
 #[inline]
@@ -82,7 +99,7 @@ struct EventCopy {
     h: u64, // hash of event_id
     event_id: Str,
     person: Str,
-    hp: u64, // hash of person
+    key: PersonKey, // the person's 128-bit identity
     ts: i64,
     ingest: i64,
     price: i32,
@@ -110,7 +127,7 @@ struct Lookups<'a> {
 /// A surviving event, with its person.
 struct Event {
     person: Str,
-    hp: u64, // hash of person
+    key: PersonKey, // the person's 128-bit identity
     ts: i64,
     price: i32,
     category: u16,
@@ -119,8 +136,7 @@ struct Event {
 
 /// A valid click, with its person.
 struct Click {
-    person: Str,
-    hp: u64, // hash of person
+    key: PersonKey, // the person's 128-bit identity
     ts: i64,
     click_id: Str,
     campaign: u32,
@@ -163,38 +179,44 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
         && !product_id.is_empty()
         && price.is_some()
         && ingest - ts <= DAY; // late: strictly over 24 h (ts is in the window here, so no overflow)
-    let (person, hp, category) = if ok {
-        let (person, hp) = lk.links.person_of(user_id);
+    let (person, key, category) = if ok {
+        let (person, key) = lk.links.person_of(user_id);
         let category = if event_type == PURCHASE {
             lk.product_category.get(product_id).copied().unwrap_or(lk.unknown)
         } else {
             0
         };
-        (person, hp, category)
+        (person, key, category)
     } else {
-        (&[][..], 0, 0)
+        (&[][..], (0, 0), 0)
     };
     Some(EventCopy {
-        h: hash(event_id), event_id, person, hp, ts, ingest, price: price.unwrap_or(0) as i32, category, event_type, ok,
+        h: hash(event_id), event_id, person, key, ts, ingest, price: price.unwrap_or(0) as i32, category, event_type, ok,
     })
 }
 
 /// Each linked ID's person: the name and its hash.
+/// One linked ID: its key, and its person's name and key, all in the table
+/// entry so a lookup is one memory access.
+struct LinkEntry {
+    id: PersonKey,
+    name: Str,
+    person: PersonKey,
+}
+
 struct Links {
-    table: HashTable<(u64, u32)>, // (hash of ID, index into ids)
-    ids: Vec<Str>,
-    person: Vec<(Str, u64)>,
+    table: HashTable<LinkEntry>,
 }
 
 impl Links {
-    /// The person an ID belongs to, and the hash of the person's name. An ID in
-    /// no link is a person on its own, named by itself.
+    /// The person an ID belongs to, and the person's key. An ID in no link is a
+    /// person on its own, named by itself. IDs are matched by their 128-bit key.
     #[inline]
-    fn person_of(&self, id: Str) -> (Str, u64) {
-        let h = hash(id);
-        match self.table.find(h, |&(eh, i)| eh == h && self.ids[i as usize] == id) {
-            Some(&(_, i)) => self.person[i as usize],
-            None => (id, h),
+    fn person_of(&self, id: Str) -> (Str, PersonKey) {
+        let key = key_of(id);
+        match self.table.find(key.0, |e| e.id == key) {
+            Some(e) => (e.name, e.person),
+            None => (id, key),
         }
     }
 }
@@ -250,12 +272,12 @@ fn person_names(links_dir: &Path) -> Links {
             name[r] = ids[i]; // byte-wise smallest ID of the person
         }
     }
-    let person: Vec<(Str, u64)> = roots.iter().map(|&r| (name[r as usize], hash(name[r as usize]))).collect();
     let mut table = HashTable::with_capacity(ids.len());
-    for (i, &id) in ids.iter().enumerate() {
-        table.insert_unique(hash(id), (hash(id), i as u32), |e: &(u64, u32)| e.0);
+    for (&id, &r) in ids.iter().zip(&roots) {
+        let (key, name) = (key_of(id), name[r as usize]);
+        table.insert_unique(key.0, LinkEntry { id: key, name, person: key_of(name) }, |e: &LinkEntry| e.id.0);
     }
-    Links { table, ids, person }
+    Links { table }
 }
 
 fn window(data: &Path) -> (i64, i64) {
@@ -319,20 +341,20 @@ struct Context {
 
 /// Events rules 5-7 and clicks rules 4-7 for the people of one bucket.
 ///
-/// People are numbered (exact name comparison), then events and clicks are
+/// People are numbered by their 128-bit key (no name is read), then events and clicks are
 /// placed person by person with a counting sort (two linear passes), so the
 /// only sorting left is by time within each person.
 fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usize, cx: &Context, tally: &mut Tally) {
     let n_events: usize = events.iter().map(|e| e[bi].len()).sum();
-    let mut number: HashTable<(u64, u32)> = HashTable::with_capacity(n_events / 4 + 16);
+    let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_events / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
     let mut counts: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = Vec::with_capacity(n_events);
     for e in events.iter().flat_map(|e| &e[bi]) {
-        let id = match number.entry(e.hp, |&(h, i)| h == e.hp && same(names[i as usize], e.person), |x| x.0) {
+        let id = match number.entry(e.key.0, |&(k, _)| k == e.key, |x| x.0.0) {
             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
             hashbrown::hash_table::Entry::Vacant(v) => {
-                v.insert((e.hp, names.len() as u32));
+                v.insert((e.key, names.len() as u32));
                 names.push(e.person);
                 counts.push(0);
                 (names.len() - 1) as u32
@@ -360,7 +382,7 @@ fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usi
     let flat_clicks: Vec<&Click> = clicks.iter().flat_map(|c| &c[bi]).collect();
     let mut ck_count = vec![0u32; people];
     for (k, c) in flat_clicks.iter().enumerate() {
-        if let Some(&(_, id)) = number.find(c.hp, |&(h, i)| h == c.hp && same(names[i as usize], c.person)) {
+        if let Some(&(_, id)) = number.find(c.key.0, |&(k, _)| k == c.key) {
             ck_count[id as usize] += 1;
             click_ids.push((id, k as u32));
         }
@@ -610,8 +632,8 @@ fn run() {
                 }
             }
             for c in kept.into_iter().filter(|c| c.ok) {
-                b[bucket(c.hp)].push(Event {
-                    person: c.person, hp: c.hp, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
+                b[bucket(c.key.0)].push(Event {
+                    person: c.person, key: c.key, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
                 });
             }
         });
@@ -638,8 +660,8 @@ fn run() {
                     return; // the click window, a week longer than the event window
                 }
                 let Some(&campaign) = campaign_index.get(campaign) else { return };
-                let (person, hp) = links.person_of(user_id);
-                b[bucket(hp)].push(Click { person, hp, ts, click_id, campaign });
+                let (_, key) = links.person_of(user_id);
+                b[bucket(key.0)].push(Click { key, ts, click_id, campaign });
             });
         });
     });

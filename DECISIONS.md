@@ -13,6 +13,20 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Person identity: 128-bit name hash instead of byte comparison
+- **Context:** Telling people apart compared their names byte by byte. For one-ID people the bytes sit in each event's own line, scattered across the input, so most comparisons and linked-ID lookups read memory that isn't in cache; on a Xeon with ~1 MB L2 per core that likely costs a trip to main memory per event
+- **Options:** A) Identify a person by two independent 64-bit hashes of the name (foldhash fast and quality variants, different seeds) and never read the name. B) Keep exact byte comparison
+- **Chose:** A, the user's decision ("lets try to 128-bit identity next"):
+  - Linked IDs are matched by the same 128-bit key, and each table entry holds the person's name and key, so a lookup is one memory access
+  - Event dedup stays exact: it compares `event_id` bytes, but only when two hashes already match (true duplicates)
+- **Pros:**
+  - 3M events (M1): ~0.275 → ~0.242 s. Parse 0.121 → 0.100 s, person pass 0.051 → 0.038 s, clicks 0.022 → 0.018 s
+  - Likely more on the scorer, whose caches are much smaller
+- **Cons / risks:**
+  - Not exact in principle: two different names sharing both hashes would merge two people. For a few million names that is about 1 in 10^26 per run, far below hardware error rates
+  - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds and at 2048 buckets
+- **Result:** — (attempt #7 pending)
+
 ## Rust speed-ups, round 3: cache-sized buckets, per-thread lists
 - **Context:** Attempt #5 scored 3.4492 s. This Mac (M1: 12 MB L2 on the fast cores) holds all our tables in cache at 3M events, but a scorer Xeon has ~1 MB L2 per core. At 20M, 256 buckets mean ~78k events per dedup table (~1.4 MB), over that limit
 - **Options:** A) Scale the bucket count with the input (~16k events each, 256–4096), with bucket lists kept per worker thread so their number doesn't grow with the input. B) Keep 256 buckets
@@ -27,7 +41,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - The cache benefit is a theory until the scorer confirms it
   - Tried and dropped: mimalloc (no gain on Linux: best 0.854 vs 0.864 s); largest-bucket-first scheduling (no gain); `taskpolicy -b` as a small-cache stand-in (memory throttling made it meaningless)
-- **Result:** — (attempt #6 pending)
+- **Result:** Attempt #6: 3.4492 → 3.5092 s (slower). The 2048-way scatter likely costs more than the smaller tables save; next, go back to 256 buckets and keep the per-thread lists
 
 ## Rust speed-ups, round 2 (after research)
 - **Context:** Attempt #4 scored 4.1392 s. 1BRC write-ups (curiouscoding.nl, morling.dev) and simdjson (Langdale & Lemire, arXiv 1902.08318) say the top parsers find all delimiters in a block at once and run at ~1–2.4 GB/s per core; ours was ~0.25 GB/s. A profiler (`/usr/bin/sample`, with `SHOPPING_REPEAT`) then showed 36% idle threads, 11% unbuffered `write`, 6% freeing memory, 11% linked-ID lookup, 10% timestamps
