@@ -13,6 +13,18 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Bloom filter in front of the linked-ID table
+- **Context:** Every event and click looks up its ID in the linked-ID table, which at 20M holds ~1.2M entries of 48 bytes (~60 MB), far beyond a Xeon core's cache. 38% of events (dev set and 3M set) come from IDs in no link, which find nothing
+- **Options:** A) A blocked Bloom filter: 8+ bits per linked ID, 2 bits per key in one 512-bit block (one cache line). A clear bit means "not linked" for sure, so the table is skipped. B) Leave the lookups as they are
+- **Chose:** A. Results can't change: a Bloom filter has no false negatives, and its ~2% false positives just do the normal lookup
+- **Pros:**
+  - Saves a probe of the big table for ~38% of events and clicks. At 20M the filter is ~2 MB
+- **Cons / risks:**
+  - Neutral on the M1 (the table fits its 12 MB L2), so the gain is a scorer-only theory
+  - Linked IDs pay one extra cache-line read
+  - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
+- **Result:** — (attempt #10 pending)
+
 ## Linked IDs built in parallel
 - **Context:** The linked-ID stage ran on one thread while the other 7 waited. At 3M it took ~21 ms (parse 2.6 ms, interning + union 10.7 ms, names + table 8.2 ms), so probably ~0.15 s locally at 20M and more on the scorer
 - **Options:** A) Parallelize every step. B) Overlap it with event parsing (that would mean resolving persons after parsing, which earlier measured slower)
@@ -24,7 +36,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - 3M events: the stage drops 0.020 → 0.010 s (whole run ~0.285 → ~0.238 s)
 - **Cons / risks:**
   - Lock-free code depends on thread timing. Checked by 8 repeated runs with identical output on 3M, plus 36/36 fixtures, the dev answer and Rust = Polars on 10 seeds
-- **Result:** — (attempt #9 pending)
+- **Result:** Attempt #9: 3.0086 → 2.8037 s
 
 ## Back to 256 buckets
 - **Context:** Attempt #6 scaled buckets with the input (2048 at 20M) and was slower, 3.4492 → 3.5092 s. The scorer is consistent (the two Polars runs were 0.01 s apart), so the loss is real

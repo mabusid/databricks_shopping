@@ -212,14 +212,36 @@ fn link_part(key: PersonKey) -> usize {
 
 struct Links {
     parts: Vec<HashTable<LinkEntry>>,
+    /// A Bloom filter of every linked ID's key: 8+ bits per ID, 2 bits set each.
+    /// A clear bit means "in no link" for sure, so most one-ID people skip the
+    /// big table (which at 20M is far larger than a Xeon core's cache).
+    bloom: Vec<u64>,
+    bloom_mask: u64, // number of 512-bit blocks - 1
 }
 
 impl Links {
+    /// The two bits of a key, both in the same 512-bit block (one cache line),
+    /// so a check reads memory once.
+    #[inline]
+    fn bloom_bits(&self, key: PersonKey) -> (usize, usize) {
+        let block = ((key.1 >> 18) & self.bloom_mask) as usize * 512;
+        (block + (key.1 & 511) as usize, block + ((key.1 >> 9) & 511) as usize)
+    }
+
+    #[inline]
+    fn maybe_linked(&self, key: PersonKey) -> bool {
+        let (a, b) = self.bloom_bits(key);
+        (self.bloom[a / 64] >> (a % 64)) & (self.bloom[b / 64] >> (b % 64)) & 1 == 1
+    }
+
     /// The person an ID belongs to, and the person's key. An ID in no link is a
     /// person on its own, named by itself. IDs are matched by their 128-bit key.
     #[inline]
     fn person_of(&self, id: Str) -> (Str, PersonKey) {
         let key = key_of(id);
+        if !self.maybe_linked(key) {
+            return (id, key);
+        }
         match self.parts[link_part(key)].find(key.0, |e| e.id == key) {
             Some(e) => (e.name, e.person),
             None => (id, key),
@@ -364,7 +386,17 @@ fn person_names(links_dir: &Path) -> Links {
             table
         })
         .collect();
-    Links { parts }
+    // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
+    let bits = (n * 8).max(1 << 16).next_power_of_two();
+    let mut links = Links { parts, bloom: vec![0u64; bits / 64], bloom_mask: (bits / 512 - 1) as u64 };
+    for p in 0..LINK_PARTS {
+        for &k in &numbered[p].0 {
+            let (a, b) = links.bloom_bits(k);
+            links.bloom[a / 64] |= 1 << (a % 64);
+            links.bloom[b / 64] |= 1 << (b % 64);
+        }
+    }
+    links
 }
 
 fn window(data: &Path) -> (i64, i64) {

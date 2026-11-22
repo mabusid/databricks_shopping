@@ -46,3 +46,53 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
 8. [ ] Profile and optimize, one change per submission
    - Attempt #2: Polars memory cuts (28.4511 s)
    - Rewrite in Rust (`native/`): matches the dev answer, 36/36 fixtures, and the Polars output on 13 generated datasets
+   - Attempts #3–#9: Rust speed-ups, 5.9099 → 2.8037 s (see SCORES.md and DECISIONS.md)
+   - Next: the plan below
+
+## Plan toward < 0.4 s (from 2.8037 s, attempt #9)
+
+### The measuring stick
+- **Linux in Docker, 4 threads, 3M events predicts the scorer.** Attempt #10's build takes 0.42 s there; × 6.67 for 20M gives 2.80 s, and attempt #9 scored 2.8037.
+- **The target.** Under 0.4 s on the scorer means **≤ 0.06 s on that proxy**, 7× faster than today. Every change is measured there (fastest of N runs, `perf`) before it is submitted.
+- **This Mac hides the costs.** The M1 has 16 KB pages and a 12 MB L2, so it runs dedup and the person pass 2× faster than Linux.
+
+### Where the time goes (Linux `perf`, 3M events)
+| Share | What |
+|---|---|
+| ~27% | Delimiter scanning and per-line glue. Building `[&[u8]; 7]`, bounds checks and 8-byte word loads are a big part |
+| 18% | **Kernel**: zeroing fresh memory on page faults (~145k faults per 3M, ~1M at 20M) |
+| ~8% | Timestamp parsing |
+| ~7.5% | Linked-ID lookups (a ~60 MB table at 20M) |
+| ~5% | Parquet writing (bit-packing of the nullable column) and merging per-thread tallies |
+| rest | Dedup and person-pass hash tables, sorting, sessions |
+
+### Floors (Linux, 4 threads, 3M events)
+- Just reading all 266 MB of event input: **0.022 s** (12 GB/s). That is ~0.15 s on the scorer.
+- Scattering 2.8M × 48-byte records into 256 buckets: **0.050 s with fresh memory, 0.011 s with reused memory**. Page faults make it 4.5× slower.
+- So under 0.4 s means the whole pipeline must run close to the cost of reading its input once: one or two compact scatters, no page faults, parsing at ~1 GB/s per thread, and every stage parallel.
+
+### Budget at 3M on the proxy (≤ 0.06 s total)
+| Stage | Today | Budget | How |
+|---|---|---|---|
+| Read + parse events | 0.205 s | ≤ 0.030 | Lean parser v2 (below), overlapped with reading |
+| Dedup | 0.059 | ≤ 0.008 | Compact records, pre-faulted memory, own prefetching table |
+| Person pass (sessions, credit, assists) | 0.078 | ≤ 0.012 | Compact 24–32 B records, reused scratch space, no reallocation |
+| Clicks | 0.029 | ≤ 0.004 | Same parser, run while dedup runs |
+| Linked IDs | 0.025 | ≤ 0.003 | Pre-faulted memory; overlap with event parsing |
+| Write | 0.023 | ≤ 0.003 | Own minimal Parquet writer (PLAIN pages, RLE definition levels) |
+
+### Techniques, in order (one submission each, measured on the proxy first)
+| # | Change | Targets | Expected on the proxy |
+|---|---|---|---|
+| 0 | `tests/bench_linux.sh` (proxy timing, `time -v`, `perf` with symbols) | measurement | — |
+| A | Memory without page faults: a per-thread arena of 2 MB huge pages (`MADV_HUGEPAGE`), pre-faulted in parallel; append-only block lists instead of growing `Vec`s; scratch space reused between passes; nothing freed | the 18% kernel time and the Linux 2× in dedup, person pass and linked IDs | 0.42 → ~0.28 s |
+| B | SIMD structural scan (ready as #11), plus a v2 line parser that works on byte positions (no `[&[u8]; 7]`, no bounds checks in the hot loop) | ~27% scanning and glue | → ~0.20 s |
+| C | Compact records: copy ≤ 48 B, event ≤ 32 B, click ≤ 32 B (u32 ms offsets, packed price/type/category, 48-bit pointers); no payload for invalid copies | memory traffic between passes | → ~0.16 s |
+| D | Fast fields: a fixed-position SWAR F1/F2 timestamp parser (`ingest_ts` is always F1), one 128-bit hash per key in one pass, branchless checks | ~8% timestamps, hashing | → ~0.13 s |
+| E | Hiding memory latency: Bloom filter (ready as #10) and software-prefetched probes in batches of 8–16 lines for the linked-ID, dedup and person tables | ~7.5% lookups, plus the dedup/person tables | → ~0.11 s |
+| F | Own Parquet writer; per-thread tallies merged in parallel | ~5% | → ~0.10 s |
+| G | No idle threads: clicks parsed during dedup; small tables parsed in parallel; linked IDs built while events are read (person resolution after dedup) | idle at stage boundaries | → ~0.08 s |
+| H | Start-up and exit: read input into reused huge-page buffers (no 4 KB file mappings to tear down); a static binary on a minimal image | fixed costs | → ~0.07 s |
+| I | Several lines interleaved per thread (1BRC: −22%); AVX2/AVX-512 scanning on the scorer | the rest of the parse | → ≤ 0.06 s |
+
+**Honest outlook.** A–F are well-understood techniques and should reach ~0.10 s on the proxy (~0.7 s on the scorer). Reaching ≤ 0.06 s (< 0.4 s) needs G–I as well, and every stage near its floor; that is what the leaders must have done. If an incremental change can't reach its budget, that stage is rewritten from scratch with this design (the current code stays as the fallback). The plan is re-checked after every score.
