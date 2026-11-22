@@ -3,16 +3,6 @@
 /// A bad timestamp. It fails every window check.
 pub const BAD: i64 = i64::MIN;
 
-#[inline]
-fn digit(b: u8) -> Option<i64> {
-    if b.is_ascii_digit() { Some((b - b'0') as i64) } else { None }
-}
-
-#[inline]
-fn two(s: &[u8], i: usize) -> Option<i64> {
-    Some(digit(s[i])? * 10 + digit(s[i + 1])?)
-}
-
 /// The value of a digits-only string with leading zeros ignored, or None if it
 /// is empty, holds a non-digit, or has more than `max_len` significant digits.
 #[inline]
@@ -54,48 +44,43 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 /// than 18 significant digits is BAD: at least 10^18 ms, it is outside any window.
 #[inline]
 pub fn ts_ms(s: &[u8]) -> i64 {
-    if let Some(v) = digits_value(s, 18) {
-        return v;
+    let n = s.len();
+    // An F1/F2 string has '-' at 4, so it can't be digits only: decide by shape first.
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        return iso_ms(s).unwrap_or(BAD);
     }
-    iso_ms(s).unwrap_or(BAD)
+    digits_value(s, 18).unwrap_or(BAD)
 }
 
+/// F1 or F2 (length 20 or 25). Every check is folded into one flag, so there
+/// is a single branch instead of one per digit.
 #[inline]
 fn iso_ms(s: &[u8]) -> Option<i64> {
     let n = s.len();
-    if !(n == 20 || n == 25) {
-        return None;
+    let b: &[u8; 20] = s[..20].try_into().ok()?;
+    let v = |i: usize| b[i].wrapping_sub(b'0'); // a digit's value; > 9 if not a digit
+    let mut bad = (b[4] != b'-') | (b[7] != b'-') | (b[10] != b'T') | (b[13] != b':') | (b[16] != b':');
+    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        bad |= v(i) > 9;
     }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-        return None;
-    }
-    let year = two(s, 0)? * 100 + two(s, 2)?;
-    let (month, day) = (two(s, 5)?, two(s, 8)?);
-    let (hour, minute, second) = (two(s, 11)?, two(s, 14)?, two(s, 17)?);
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month)
-        || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
+    let two = |i: usize| v(i) as i64 * 10 + v(i + 1) as i64;
+    let year = two(0) * 100 + two(2);
+    let (month, day, hour, minute, second) = (two(5), two(8), two(11), two(14), two(17));
+    bad |= !(1..=12).contains(&month) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59);
     let offset_s = if n == 20 {
-        if s[19] != b'Z' {
-            return None;
-        }
+        bad |= b[19] != b'Z';
         0
     } else {
-        let sign = match s[19] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        if s[22] != b':' {
-            return None;
-        }
-        let (oh, om) = (two(s, 20)?, two(s, 23)?);
-        if oh > 23 || om > 59 {
-            return None;
-        }
-        sign * (oh * 3600 + om * 60)
+        let o: &[u8; 5] = s[20..25].try_into().ok()?;
+        let w = |i: usize| o[i].wrapping_sub(b'0');
+        bad |= (w(0) > 9) | (w(1) > 9) | (o[2] != b':') | (w(3) > 9) | (w(4) > 9) | ((b[19] != b'+') & (b[19] != b'-'));
+        let (oh, om) = (w(0) as i64 * 10 + w(1) as i64, w(3) as i64 * 10 + w(4) as i64);
+        bad |= (oh > 23) | (om > 59);
+        (if b[19] == b'-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
     };
+    if bad || day > days_in_month(year, month) {
+        return None;
+    }
     let days = days_from_civil(year, month, day);
     Some((days * 86400 + hour * 3600 + minute * 60 + second - offset_s) * 1000)
 }

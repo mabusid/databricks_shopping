@@ -51,21 +51,17 @@ fn hash(key: Str) -> u64 {
     hasher().hash_one(key)
 }
 
-/// A second, independent hash (foldhash's other variant, another seed).
-#[inline]
-fn hash2(key: Str) -> u64 {
-    foldhash::quality::FixedState::with_seed(0x9e37_79b9_7f4a_7c15).hash_one(key)
-}
-
-/// A person's identity: (hash, hash2) of their name, 128 bits. People are told
+/// A person's identity: the 128-bit XXH3 hash of their name. People are told
 /// apart by it without reading their names, which for one-ID people are scattered
 /// across the input. Two different names would share it about once in 10^26 runs
 /// (the user's decision; see DECISIONS.md).
 type PersonKey = (u64, u64);
 
+/// Both halves come from one pass of XXH3-128 over the bytes.
 #[inline]
 fn key_of(name: Str) -> PersonKey {
-    (hash(name), hash2(name))
+    let h = xxhash_rust::xxh3::xxh3_128(name);
+    (h as u64, (h >> 64) as u64)
 }
 
 /// Each key is hashed once; the hash's top bits pick its bucket
@@ -224,7 +220,7 @@ const LINK_PARTS: usize = 64;
 
 #[inline]
 fn link_part(key: PersonKey) -> usize {
-    (key.1 >> 58) as usize // hash2's top bits: the tables hash by key.0
+    (key.1 >> 58) as usize // the key's second half: the tables hash by key.0
 }
 
 struct Links {

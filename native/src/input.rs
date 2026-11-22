@@ -225,15 +225,20 @@ pub fn for_each_record<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(O
                 let mut out: [&'static [u8]; N] = [&[]; N];
                 let mut s = line_start;
                 let mut boundary = 0u32;
+                let last = n - 1; // the chunk is not empty here: it holds this line
                 for k in 0..N {
                     let e = if k + 1 < N { commas[k] } else { end };
-                    let (mut fs, mut fe) = (s, e);
-                    if quotes != 0 && e - s >= 2 && chunk[s] == b'"' && chunk[e - 1] == b'"' {
-                        fs += 1;
-                        fe -= 1;
-                        boundary += 2;
-                    }
-                    out[k] = &chunk[fs..fe];
+                    // Branchless: read the field's first and last byte from clamped
+                    // (always valid) positions; strip one quote at each end only if
+                    // both are quotes and the field has at least 2 bytes.
+                    // SAFETY: both indices are clamped to 0..=last.
+                    let (first, final_) = unsafe {
+                        (*chunk.get_unchecked(s.min(last)), *chunk.get_unchecked(e.max(1).wrapping_sub(1).min(last)))
+                    };
+                    let q = ((quotes != 0) & (e >= s + 2) & (first == b'"') & (final_ == b'"')) as usize;
+                    // SAFETY: line_start <= s <= e <= n, so s + q <= e - q.
+                    out[k] = unsafe { chunk.get_unchecked(s + q..e - q) };
+                    boundary += 2 * q as u32;
                     s = e + 1;
                 }
                 f(if boundary == quotes { Some(out) } else { None });

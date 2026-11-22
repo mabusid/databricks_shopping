@@ -13,6 +13,20 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Parse: branchless field quotes, one-check timestamps, XXH3-128 person keys
+- **Context:** A line-level Linux profile of #13 put 14% of the whole run on one line: the per-field check of whether a field is wrapped in quotes (`quotes != 0 && e - s >= 2 && chunk[s] == '"' && chunk[e-1] == '"'`). ~20% of fields are quoted at random, so the branch mispredicts about once per line. Timestamps were ~10%
+- **Options:** A) Rewrite these three hot spots in place. B) A full rewrite of the line loop
+- **Chose:** A:
+  - Quotes: read each field's first and last byte from clamped (always valid) positions, combine the checks with `&`, and strip arithmetically, with no branch
+  - Timestamps: dispatch on shape (length 20/25 with `-` at 4 → ISO) so ISO strings skip the all-digits attempt; fold every digit, separator and range check into one flag
+  - Person keys: XXH3-128 (`xxhash-rust`) gives both 64-bit halves in one pass, instead of two foldhash passes
+- **Pros:**
+  - Linux proxy (2M, interleaved with #13): parse done at 0.152 → 0.129 s in the best runs; mean 0.302 → 0.252 s
+- **Cons / risks:**
+  - Some unsafe indexing (clamped, commented)
+  - Checks: unit tests (timestamp edge cases, 50k-chunk fuzz test), 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15, and the emulated amd64 image (dev answer, 36/36)
+- **Result:** — (attempt #14 pending)
+
 ## Memory: pooled block lists on 2 MB huge pages
 - **Context:** A Linux experiment on 2M events (4 threads) split the parse pass: scan 0.029 s, + timestamps 0.053 s, + person lookup 0.077 s, full parse 0.083 s, **+ push into fresh memory 0.194 s**, + push into reused memory 0.115 s. Writing records into fresh memory cost more than all the parsing
 - **Options:**
