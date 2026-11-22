@@ -1,0 +1,11 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+data/
+dev-answer/
+.venv/
+starter/
+generator/
+*.zip
