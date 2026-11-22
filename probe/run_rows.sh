@@ -6,7 +6,7 @@
 T0=$EPOCHREALTIME
 D=${DATA_DIR:-/data}; O=${OUTPUT_DIR:-/output}; S=${SCRATCH_DIR:-/scratch}
 [ -f /app/probe60 ] && PROBE_60=${PROBE_60:-$(cat /app/probe60)}
-EV20=${PROBE_EV20:-20000000}; EV60=${PROBE_EV60:-60000000}; ROUNDS=${PROBE_ROUNDS:-3}
+EV20=${PROBE_EV20:-20000000}; EV60=${PROBE_EV60:-60000000}; ROUNDS=${PROBE_ROUNDS:-2}
 el() { awk "BEGIN{printf \"%.1f\", $EPOCHREALTIME - $T0}"; }
 SUM=$S/sum.txt; LOG=$S/log.txt; : > "$SUM"; : > "$LOG"
 row() { printf '%s\t%s\t%s\n' "$1" "$(echo "$2" | tr -s ' \t\n' ' ' | cut -c1-900)" "$(echo "$3" | tr -s ' \t\n' ' ' | cut -c1-900)" >> "$SUM"; }

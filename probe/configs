@@ -1,0 +1,10 @@
+a_main-v3 a_main-v3
+d-v3 d_now-v3
+d-v3-compact d_now-v3 SHOPPING_COMPACT_OUT=1
+d-v3-compact-t16 d_now-v3 SHOPPING_COMPACT_OUT=1 NCPU=16
+d-v3-read d_now-v3 SHOPPING_READ=1
+d-v3-pf16 d_now-v3 SHOPPING_PIPELINE=16
+d-v3-clickpf8 d_now-v3 SHOPPING_CLICK_PIPELINE=8
+d-v3-b11 d_now-v3 SHOPPING_BUCKET_BITS=11
+d-v3-t16 d_now-v3 NCPU=16
+a_main-base a_main-base
