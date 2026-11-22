@@ -38,7 +38,25 @@ pub fn map(path: &Path) -> &'static [u8] {
     }
     let mmap = unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let mmap: &'static Mmap = Box::leak(Box::new(mmap));
+    MAPPED.lock().unwrap().push((mmap.as_ptr() as usize, mmap.len()));
     &mmap[..]
+}
+
+/// Every file mapping made by `map`, as (address, length).
+static MAPPED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Unmap every input file, in parallel: the kernel's single-threaded exit
+/// teardown then has far fewer pages left to unmap.
+///
+/// # Safety
+/// No slice returned by `map` (or derived from one) may be used afterwards.
+pub unsafe fn unmap_all() {
+    use rayon::prelude::*;
+    let maps = std::mem::take(&mut *MAPPED.lock().unwrap());
+    maps.par_iter().for_each(|&(p, len)| {
+        // SAFETY: (p, len) is a live mapping made by `map`; the caller promises it is no longer used.
+        unsafe { libc::munmap(p as *mut libc::c_void, len) };
+    });
 }
 
 /// Read a whole file into fresh (lazily mapped, huge-page) memory with parallel preads.

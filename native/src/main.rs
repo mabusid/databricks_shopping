@@ -273,6 +273,20 @@ struct UserRow {
     top: Option<u16>,
 }
 
+/// `view`, `cart` or `purchase` exactly (case-sensitive, untrimmed), else BAD_TYPE:
+/// a length check and one integer compare, no memcmp call.
+#[inline(always)]
+fn event_kind(t: Str) -> u8 {
+    match t.len() {
+        4 => {
+            let w = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+            if w == u32::from_le_bytes(*b"view") { VIEW } else if w == u32::from_le_bytes(*b"cart") { CART } else { BAD_TYPE }
+        }
+        8 if u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => PURCHASE,
+        _ => BAD_TYPE,
+    }
+}
+
 /// Events rules 1 and 3-4 for one well-formed line's fields: None if the event_id is empty.
 #[inline]
 fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
@@ -286,12 +300,7 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
         return None; // never happens: ingest_ts is always valid F1
     }
     let ts = ts_ms(ts);
-    let event_type = match event_type {
-        b"view" => VIEW,
-        b"cart" => CART,
-        b"purchase" => PURCHASE,
-        _ => BAD_TYPE, // case-sensitive, untrimmed
-    };
+    let event_type = event_kind(event_type);
     let price = if event_type == PURCHASE { parse::price(price) } else { Some(0) };
     let ok = !user_id.is_empty()
         && ts >= start
@@ -1263,6 +1272,9 @@ fn run() {
     log(&format!("wrote {user_rows} user_daily rows"));
     log_rusage();
     std::mem::forget(tallies); // freeing costs time and the process ends now
+    // Everything is written; nothing reads the input any more.
+    // SAFETY: no slice of a mapped file is used after this point.
+    unsafe { input::unmap_all() };
 }
 
 /// CPU time, page faults and peak memory of the run so far, to stderr.
