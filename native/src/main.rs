@@ -101,14 +101,54 @@ fn by_bucket<T: Copy>(per_thread: Vec<Vec<BlockList<T>>>) -> Vec<Vec<BlockList<T
     out
 }
 
+/// A string slice in 8 bytes: a 48-bit address and a 16-bit length (user-space
+/// addresses fit in 48 bits on x86-64 and arm64 Linux). A slice that doesn't fit
+/// (65,535+ bytes, or a higher address) goes to a side table instead, so every
+/// value stays exact. Smaller records mean less memory written between passes.
+#[derive(Clone, Copy)]
+struct PStr(u64);
+
+const PSTR_SPILL: u64 = 0xFFFF;
+static PSTR_SPILLED: std::sync::Mutex<Vec<Str>> = std::sync::Mutex::new(Vec::new());
+
+impl PStr {
+    #[inline]
+    fn new(s: Str) -> PStr {
+        let p = s.as_ptr() as u64;
+        if p >> 48 == 0 && (s.len() as u64) < PSTR_SPILL {
+            PStr(p | (s.len() as u64) << 48)
+        } else {
+            let mut spilled = PSTR_SPILLED.lock().unwrap();
+            spilled.push(s);
+            PStr((spilled.len() - 1) as u64 | PSTR_SPILL << 48)
+        }
+    }
+
+    #[inline]
+    fn get(self) -> Str {
+        let len = self.0 >> 48;
+        if len == PSTR_SPILL {
+            return PSTR_SPILLED.lock().unwrap()[(self.0 & ((1 << 48) - 1)) as usize];
+        }
+        // SAFETY: built by `new` from a 'static slice of exactly this address and length.
+        unsafe { std::slice::from_raw_parts((self.0 & ((1 << 48) - 1)) as *const u8, len as usize) }
+    }
+
+    /// Equal slices; the same packed value means the same bytes, without reading them.
+    #[inline]
+    fn same(self, other: PStr) -> bool {
+        self.0 == other.0 || self.get() == other.get()
+    }
+}
+
 /// One copy of an event, as parsed. `ok`: rules 3-4 hold for this copy. For a
 /// copy that is ok, its person and category are looked up while parsing,
 /// when the line is still in cache; for one that isn't they are left empty.
 #[derive(Clone, Copy)]
 struct EventCopy {
     h: u64, // hash of event_id
-    event_id: Str,
-    person: Str,
+    event_id: PStr,
+    person: PStr,
     key: PersonKey, // the person's 128-bit identity
     ts: i64,
     ingest: i64,
@@ -118,12 +158,9 @@ struct EventCopy {
     ok: bool,
 }
 
-/// Equal slices: the same bytes at the same place are equal without reading them
-/// (every ID of a linked person points at one shared name).
-#[inline]
-fn same(a: Str, b: Str) -> bool {
-    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
-}
+const _: () = assert!(std::mem::size_of::<EventCopy>() == 64);
+const _: () = assert!(std::mem::size_of::<Event>() == 40);
+const _: () = assert!(std::mem::size_of::<Click>() == 40);
 
 /// What parsing an event needs: the window and the lookups.
 struct Lookups<'a> {
@@ -137,7 +174,7 @@ struct Lookups<'a> {
 /// A surviving event, with its person.
 #[derive(Clone, Copy)]
 struct Event {
-    person: Str,
+    person: PStr,
     key: PersonKey, // the person's 128-bit identity
     ts: i64,
     price: i32,
@@ -150,7 +187,7 @@ struct Event {
 struct Click {
     key: PersonKey, // the person's 128-bit identity
     ts: i64,
-    click_id: Str,
+    click_id: PStr,
     campaign: u32,
 }
 
@@ -203,7 +240,8 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
         (&[][..], (0, 0), 0)
     };
     Some(EventCopy {
-        h: hash(event_id), event_id, person, key, ts, ingest, price: price.unwrap_or(0) as i32, category, event_type, ok,
+        h: hash(event_id), event_id: PStr::new(event_id), person: PStr::new(person), key, ts, ingest,
+        price: price.unwrap_or(0) as i32, category, event_type, ok,
     })
 }
 
@@ -497,7 +535,7 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
             hashbrown::hash_table::Entry::Vacant(v) => {
                 v.insert((e.key, names.len() as u32));
-                names.push(e.person);
+                names.push(e.person.get());
                 counts.push(0);
                 (names.len() - 1) as u32
             }
@@ -538,7 +576,7 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
     for &(id, k) in &click_ids {
         let c = flat_clicks[k as usize];
         let at = &mut fill[id as usize];
-        cks[*at as usize] = (c.ts, c.click_id, c.campaign);
+        cks[*at as usize] = (c.ts, c.click_id.get(), c.campaign);
         *at += 1;
     }
     drop(click_ids);
@@ -762,7 +800,7 @@ fn run() {
             let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
             let mut kept: Vec<&EventCopy> = Vec::with_capacity(n);
             for c in lists.iter().flat_map(|l| l.iter()) {
-                match first.entry(c.h, |&(h, k)| h == c.h && same(kept[k as usize].event_id, c.event_id), |e| e.0) {
+                match first.entry(c.h, |&(h, k)| h == c.h && kept[k as usize].event_id.same(c.event_id), |e| e.0) {
                     hashbrown::hash_table::Entry::Occupied(e) => {
                         let k = e.get().1 as usize;
                         if c.ingest < kept[k].ingest {
@@ -805,7 +843,7 @@ fn run() {
                 }
                 let Some(&campaign) = campaign_index.get(campaign) else { return };
                 let (_, key) = links.person_of(user_id);
-                b[bucket(key.0)].push(Click { key, ts, click_id, campaign });
+                b[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
             });
         });
     });

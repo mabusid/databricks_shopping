@@ -13,6 +13,17 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Compact records: 8-byte string slices
+- **Context:** The parse-pass split (Linux, 2M) still put the biggest cost on writing records into fresh memory: + 0.09–0.13 s for fresh block lists against + 0.03–0.04 s reused. That cost scales with the bytes written
+- **Options:** A) Pack each string slice into 8 bytes (48-bit address, 16-bit length), so copy 80 → 64 B, event 48 → 40 B, click 48 → 40 B. B) Also shrink timestamps to u32 offsets (more code, ~4 more bytes)
+- **Chose:** A. Exactness is unchanged: a slice that can't be packed (65,535+ bytes, or an address above 2^48) goes to a side table; compile-time asserts pin the sizes
+- **Pros:**
+  - Linux proxy (2M, 20 interleaved runs each vs #14): best 0.209 → 0.206 s, p25 0.222 → 0.210 s, median 0.238 → 0.217 s
+- **Cons / risks:**
+  - Relies on 48-bit user-space addresses (true for x86-64 4-level paging and arm64 Linux), with the side table as a safe fallback
+  - Checks: unit tests, 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15
+- **Result:** — (attempt #15 pending)
+
 ## Parse: branchless field quotes, one-check timestamps, XXH3-128 person keys
 - **Context:** A line-level Linux profile of #13 put 14% of the whole run on one line: the per-field check of whether a field is wrapped in quotes (`quotes != 0 && e - s >= 2 && chunk[s] == '"' && chunk[e-1] == '"'`). ~20% of fields are quoted at random, so the branch mispredicts about once per line. Timestamps were ~10%
 - **Options:** A) Rewrite these three hot spots in place. B) A full rewrite of the line loop
@@ -25,7 +36,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Some unsafe indexing (clamped, commented)
   - Checks: unit tests (timestamp edge cases, 50k-chunk fuzz test), 36/36 fixtures, dev answer, Rust = Polars on 10 seeds + seed 15, and the emulated amd64 image (dev answer, 36/36)
-- **Result:** — (attempt #14 pending)
+- **Result:** Submitted with #13 as `004123b`: 2.4810 → 2.2333 s for both changes
 
 ## Memory: pooled block lists on 2 MB huge pages
 - **Context:** A Linux experiment on 2M events (4 threads) split the parse pass: scan 0.029 s, + timestamps 0.053 s, + person lookup 0.077 s, full parse 0.083 s, **+ push into fresh memory 0.194 s**, + push into reused memory 0.115 s. Writing records into fresh memory cost more than all the parsing
@@ -40,7 +51,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Some unsafe code (raw block pointers), kept in `blocks.rs`, with a unit test for push, iterate, release and reuse across types
   - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds and at 2048 buckets
-- **Result:** — (attempt #13 pending)
+- **Result:** Submitted with #14 as `004123b`: 2.4810 → 2.2333 s for both changes
 
 ## Output: one tally per thread, null and non-null rows in separate parts
 - **Context:** Linux `perf` on #11 (2M events): `Tally::merge` 2.7%; Parquet bit-packing of `top_category`'s null markers 3.5%. rayon's `fold` made a tally per work split, so dozens of ~1 MB campaign × day arrays were merged pairwise
