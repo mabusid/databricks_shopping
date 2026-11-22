@@ -353,6 +353,33 @@ pub fn small_table<const N: usize>(path: &Path) -> Vec<[&'static [u8]; N]> {
 mod tests {
     use super::*;
 
+    /// Scanner speed on real data, one thread: SHOPPING_BENCH_DIR=<dataset> cargo test --release bench_scan -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_scan() {
+        let dir = std::path::PathBuf::from(std::env::var("SHOPPING_BENCH_DIR").expect("SHOPPING_BENCH_DIR"));
+        let chunks = dir_chunks(&dir.join("events"), 2 << 20);
+        let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut best = f64::MAX;
+        let mut lines = 0usize;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let (mut n, mut acc) = (0usize, 0usize);
+            for &c in &chunks {
+                for_each_record::<7>(c, |r| {
+                    n += 1;
+                    if let Some(f) = r {
+                        acc = acc.wrapping_add(f[0].len() ^ f[1].len() ^ f[2].len() ^ f[6].len()).wrapping_add(f[3].as_ptr() as usize);
+                    }
+                });
+            }
+            std::hint::black_box(acc);
+            lines = n;
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("scan: {lines} lines, {:.1} ns/line, {:.2} GB/s", best * 1e9 / lines as f64, bytes as f64 / best / 1e9);
+    }
+
     fn old_way<const N: usize>(chunk: &'static [u8]) -> Vec<Option<[&'static [u8]; N]>> {
         let mut v = Vec::new();
         for_each_line(chunk, |line| v.push(fields::<N>(line)));

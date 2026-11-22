@@ -8,3 +8,4 @@ generator.zip
 dev-answer.zip
 .DS_Store
 native/target/
+probe/variants/
