@@ -15,7 +15,7 @@ stages() {
   awk '{t=$1; sub(/s$/,"",t)}
     /small tables/ {l=t} /events parsed|events and clicks parsed/ {p=t} /deduped/ {d=t} /sessions, credit/ {s=t} /user_daily rows/ {w=t}
     /^rusage/ {rss=$11} /^checksum/ {ck=substr($5,1,4)}
-    END {printf "L%.2f P%.2f D%.2f S%.2f r%d %s", l, p-l, d-p, s-d, rss/1000, ck}' "$1"
+    END {printf "L%.2f P%.2f D%.2f S%.2f r%.1fG %s", l, p-l, d-p, s-d, rss/1000, ck}' "$1"
 }
 run() { # run BIN DATA [VAR=VALUE...]: prints "wall stages" or "wall EXITn"
   local bin=$1 data=$2; shift 2
