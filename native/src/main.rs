@@ -273,6 +273,20 @@ struct UserRow {
     top: Option<u16>,
 }
 
+/// `view`, `cart` or `purchase` exactly (case-sensitive, untrimmed), else BAD_TYPE:
+/// a length check and one integer compare, no memcmp call.
+#[inline(always)]
+fn event_kind(t: Str) -> u8 {
+    match t.len() {
+        4 => {
+            let w = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+            if w == u32::from_le_bytes(*b"view") { VIEW } else if w == u32::from_le_bytes(*b"cart") { CART } else { BAD_TYPE }
+        }
+        8 if u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => PURCHASE,
+        _ => BAD_TYPE,
+    }
+}
+
 /// Events rules 1 and 3-4 for one well-formed line's fields: None if the event_id is empty.
 #[inline]
 fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
@@ -286,12 +300,7 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
         return None; // never happens: ingest_ts is always valid F1
     }
     let ts = ts_ms(ts);
-    let event_type = match event_type {
-        b"view" => VIEW,
-        b"cart" => CART,
-        b"purchase" => PURCHASE,
-        _ => BAD_TYPE, // case-sensitive, untrimmed
-    };
+    let event_type = event_kind(event_type);
     let price = if event_type == PURCHASE { parse::price(price) } else { Some(0) };
     let ok = !user_id.is_empty()
         && ts >= start
@@ -370,14 +379,20 @@ const NO_KEY: PersonKey = (0, 0);
 
 /// One part's table: open addressing, linear probing, at most half full.
 struct LinkPart {
-    slots: Vec<LinkSlot>,
+    slots: &'static [LinkSlot],
     mask: usize,
 }
 
 impl LinkPart {
-    fn build(entries: &[LinkSlot]) -> LinkPart {
-        let cap = (entries.len() * 2).max(16).next_power_of_two();
-        let mut slots = vec![LinkSlot { id: NO_KEY, person: 0, name: PStr(0) }; cap];
+    /// Slots for `entries`: a power of two, at least twice as many.
+    fn capacity(entries: usize) -> usize {
+        (entries * 2).max(16).next_power_of_two()
+    }
+
+    /// Fill `slots` (all empty, `capacity(entries.len())` of them) with `entries`.
+    fn build(entries: &[LinkSlot], slots: &'static mut [LinkSlot]) -> LinkPart {
+        let cap = slots.len();
+        debug_assert_eq!(cap, Self::capacity(entries.len()));
         for e in entries {
             let mut i = e.id.0 as usize & (cap - 1);
             while slots[i].id != NO_KEY {
@@ -445,7 +460,7 @@ struct Links {
     /// A Bloom filter of every linked ID's key: 8+ bits per ID, 2 bits set each.
     /// A clear bit means "in no link" for sure, so most one-ID people skip the
     /// big table (which at 20M is far larger than a Xeon core's cache).
-    bloom: Vec<u64>,
+    bloom: &'static [u64],
     bloom_mask: u64, // number of 512-bit blocks - 1
 }
 
@@ -510,7 +525,11 @@ impl Links {
 ///   4. build each part's lookup table.
 fn person_names(links_dir: &Path) -> Links {
     use std::sync::atomic::{AtomicU32, Ordering::{AcqRel, Acquire, Relaxed}};
-    let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, CHUNK_BYTES)
+    let lt = Instant::now();
+    let lt_on = std::env::var("SHOPPING_LINK_TIMES").is_ok();
+    let lmark = |what: &str| if lt_on { eprintln!("    links {:.4}s {what}", lt.elapsed().as_secs_f64()) };
+    // Small chunks: the links are only ~1% of the input, and every thread should get some.
+    let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, 256 << 10)
         .par_iter()
         .flat_map_iter(|&chunk| {
             let mut pairs = Vec::new();
@@ -526,6 +545,7 @@ fn person_names(links_dir: &Path) -> Links {
         .collect();
     let side = |o: u32| -> Str { let (a, b) = pairs[(o / 2) as usize]; if o % 2 == 0 { a } else { b } };
 
+    lmark("parse");
     // 1. Each occurrence o = 2 * pair + side goes to its ID's part; each part numbers its IDs.
     const CHUNK: usize = 4096;
     let threads = rayon::current_num_threads();
@@ -562,6 +582,7 @@ fn person_names(links_dir: &Path) -> Links {
             (keys, first, numbers)
         })
         .collect();
+    lmark("number");
     let mut offset = vec![0u32; LINK_PARTS + 1];
     for p in 0..LINK_PARTS {
         offset[p + 1] = offset[p] + numbered[p].0.len() as u32;
@@ -579,6 +600,7 @@ fn person_names(links_dir: &Path) -> Links {
         .collect::<Vec<_>>()
         .concat();
 
+    lmark("gather");
     // 2. Union-find.
     let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
     fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
@@ -609,6 +631,7 @@ fn person_names(links_dir: &Path) -> Links {
     });
     let roots: Vec<u32> = (0..n as u32).into_par_iter().map(|i| find(&parent, i)).collect();
 
+    lmark("union");
     // 3. Each person's byte-wise smallest ID (distinct IDs never have equal bytes).
     const NONE: u32 = u32::MAX;
     let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NONE)).collect();
@@ -623,6 +646,7 @@ fn person_names(links_dir: &Path) -> Links {
         }
     });
 
+    lmark("min-name");
     // 4. The lookup tables.
     let slots: Vec<Vec<LinkSlot>> = (0..LINK_PARTS)
         .into_par_iter()
@@ -635,18 +659,26 @@ fn person_names(links_dir: &Path) -> Links {
         })
         .collect();
     let zero = slots.iter().flatten().find(|e| e.id == NO_KEY).map(|e| (e.name, e.person));
-    let parts: Vec<LinkPart> = slots
-        .par_iter()
-        .map(|entries| {
-            let real: Vec<LinkSlot> = entries.iter().filter(|e| e.id != NO_KEY).copied().collect();
-            LinkPart::build(&real)
-        })
-        .collect();
+    // All parts' slots in one huge-page table (one random access per event lands here).
+    let reals: Vec<Vec<LinkSlot>> =
+        slots.par_iter().map(|entries| entries.iter().filter(|e| e.id != NO_KEY).copied().collect()).collect();
+    let caps: Vec<usize> = reals.iter().map(|r| LinkPart::capacity(r.len())).collect();
+    // SAFETY: all-zero bytes are a valid LinkSlot (an empty one: id NO_KEY, PStr(0)).
+    let mut table: &'static mut [LinkSlot] = unsafe { blocks::huge_zeroed(caps.iter().sum()) };
+    let mut pieces = Vec::with_capacity(LINK_PARTS);
+    for &cap in &caps {
+        let (piece, rest) = std::mem::take(&mut table).split_at_mut(cap);
+        pieces.push(piece);
+        table = rest;
+    }
+    let parts: Vec<LinkPart> = reals.par_iter().zip(pieces).map(|(real, piece)| LinkPart::build(real, piece)).collect();
+    lmark("tables");
     // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
     let bits = (n * 8).max(1 << 16).next_power_of_two();
-    let mut links = Links { parts, zero, bloom: Vec::new(), bloom_mask: (bits / 512 - 1) as u64 };
+    let mut links = Links { parts, zero, bloom: &[], bloom_mask: (bits / 512 - 1) as u64 };
     // Set every key's two bits, all parts in parallel (atomic OR; order doesn't matter).
-    let words: Vec<std::sync::atomic::AtomicU64> = (0..bits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    // SAFETY: an all-zero AtomicU64 is a valid (zero) value.
+    let words: &'static [std::sync::atomic::AtomicU64] = unsafe { blocks::huge_zeroed(bits / 64) };
     numbered.par_iter().for_each(|(keys, _, _)| {
         for &k in keys {
             let (a, b) = links.bloom_bits(k);
@@ -654,7 +686,10 @@ fn person_names(links_dir: &Path) -> Links {
             words[b / 64].fetch_or(1 << (b % 64), Relaxed);
         }
     });
-    links.bloom = words.into_iter().map(|w| w.into_inner()).collect();
+    // SAFETY: every write above is done (the parallel loop has joined); AtomicU64
+    // has the same layout as u64, and the words are never written again.
+    links.bloom = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u64, words.len()) };
+    lmark("bloom");
     links
 }
 
@@ -952,7 +987,17 @@ static WR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 
 fn run() {
     let t0 = Instant::now();
-    let log = |what: &str| eprintln!("{:8.3}s  {what}", t0.elapsed().as_secs_f64());
+    let log = |what: &str| {
+        let rss = if std::env::var("SHOPPING_RSS").is_ok() {
+            // SAFETY: getrusage only writes the struct it is given.
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            format!("  [maxrss {} MB]", if cfg!(target_os = "macos") { u.ru_maxrss / 1_000_000 } else { u.ru_maxrss / 1000 })
+        } else {
+            String::new()
+        };
+        eprintln!("{:8.3}s  {what}{rss}", t0.elapsed().as_secs_f64())
+    };
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
 
@@ -963,37 +1008,40 @@ fn run() {
     let days = ((end - 1).div_euclid(DAY) - base_day + 1) as usize;
 
     // Rule 7: categories from products.csv; a product not in it is `unknown`.
-    let products = input::small_table::<2>(&data.join("products.csv"));
-    let mut category_names: Vec<Str> = Vec::new();
-    let mut category_index: Map<Str, u16> = Map::with_hasher(hasher());
-    let mut product_category: Map<Str, u16> = Map::with_capacity_and_hasher(products.len(), hasher());
-    for [product, category] in &products {
-        let c = *category_index.entry(category).or_insert_with(|| {
-            category_names.push(category);
-            (category_names.len() - 1) as u16
-        });
-        product_category.entry(product).or_insert(c);
-    }
-    let unknown = category_names.len() as u16;
-    category_names.push(b"unknown");
-    assert!(category_names.len() <= 128, "categories are stored in 7 bits");
-    let mut category_order: Vec<u16> = (0..category_names.len() as u16).collect();
-    category_order.sort_by_key(|&c| category_names[c as usize]);
-
-    let campaign_rows = input::small_table::<2>(&data.join("campaigns.csv"));
-    let mut campaign_index: Map<Str, u32> = Map::with_capacity_and_hasher(campaign_rows.len(), hasher());
-    let mut campaign_ids: Vec<Str> = Vec::new();
-    let mut channels: Vec<Str> = Vec::new();
-    for [campaign, channel] in &campaign_rows {
-        if let Entry::Vacant(e) = campaign_index.entry(campaign) {
-            e.insert(campaign_ids.len() as u32);
-            campaign_ids.push(campaign);
-            channels.push(channel);
+    // The small tables are read while the linked IDs are built.
+    let (small, links) = rayon::join(|| {
+        let products = input::small_table::<2>(&data.join("products.csv"));
+        let mut category_names: Vec<Str> = Vec::new();
+        let mut category_index: Map<Str, u16> = Map::with_hasher(hasher());
+        let mut product_category: Map<Str, u16> = Map::with_capacity_and_hasher(products.len(), hasher());
+        for [product, category] in &products {
+            let c = *category_index.entry(category).or_insert_with(|| {
+                category_names.push(category);
+                (category_names.len() - 1) as u16
+            });
+            product_category.entry(product).or_insert(c);
         }
-    }
-    let campaigns = campaign_ids.len();
+        let unknown = category_names.len() as u16;
+        category_names.push(b"unknown");
+        assert!(category_names.len() <= 128, "categories are stored in 7 bits");
+        let mut category_order: Vec<u16> = (0..category_names.len() as u16).collect();
+        category_order.sort_by_key(|&c| category_names[c as usize]);
 
-    let links = person_names(&data.join("links"));
+        let campaign_rows = input::small_table::<2>(&data.join("campaigns.csv"));
+        let mut campaign_index: Map<Str, u32> = Map::with_capacity_and_hasher(campaign_rows.len(), hasher());
+        let mut campaign_ids: Vec<Str> = Vec::new();
+        let mut channels: Vec<Str> = Vec::new();
+        for [campaign, channel] in &campaign_rows {
+            if let Entry::Vacant(e) = campaign_index.entry(campaign) {
+                e.insert(campaign_ids.len() as u32);
+                campaign_ids.push(campaign);
+                channels.push(channel);
+            }
+        }
+        let campaigns = campaign_ids.len();
+        (category_names, product_category, unknown, category_order, campaign_index, campaign_ids, channels, campaigns)
+    }, || person_names(&data.join("links")));
+    let (category_names, product_category, unknown, category_order, campaign_index, campaign_ids, channels, campaigns) = small;
     log("small tables and linked IDs");
 
     // Event chunks, and the bucket count.
@@ -1020,7 +1068,8 @@ fn run() {
     // Block memory: an event line (46+ bytes) leaves at most 48 bytes of records, a
     // click line (21+ bytes) 24, plus every list's partly filled last block.
     let click_bytes: usize = click_chunks.iter().map(|c| c.len()).sum();
-    blocks::init(event_bytes * 11 / 10 + click_bytes * 12 / 10 + 3 * buckets() * threads * blocks::BLOCK_BYTES + (256 << 20));
+    // Plus each thread's partly used 1 MB chunk.
+    blocks::init(event_bytes * 11 / 10 + click_bytes * 12 / 10 + 3 * buckets() * threads * blocks::BLOCK_BYTES + (threads << 20) + (256 << 20));
     let work: Vec<(bool, &'static [u8])> =
         event_chunks.iter().map(|&c| (false, c)).chain(click_chunks.iter().map(|&c| (true, c))).collect();
     let lists: Vec<ParseLists> = per_thread(threads, ParseLists::new, |acc| {
@@ -1263,6 +1312,9 @@ fn run() {
     log(&format!("wrote {user_rows} user_daily rows"));
     log_rusage();
     std::mem::forget(tallies); // freeing costs time and the process ends now
+    // Everything is written; nothing reads the input any more.
+    // SAFETY: no slice of a mapped file is used after this point.
+    unsafe { input::unmap_all() };
 }
 
 /// CPU time, page faults and peak memory of the run so far, to stderr.
