@@ -1,48 +1,71 @@
-//! Append-only lists made of fixed-size blocks from one shared pool.
+//! Append-only lists made of fixed-size blocks, carved from one big reserved arena.
 //!
-//! On Linux, writing to fresh memory is expensive: every 4 KB page faults and
-//! the kernel zeroes it (measured: pushing parsed event copies into fresh
-//! memory took 0.19 s on 2M events, into reused memory 0.11 s). So lists here
-//! never reallocate, and a list that is done with gives its blocks back to the
-//! pool, where the next lists (events, clicks) pick them up already mapped.
-//! Nothing is ever returned to the OS.
+//! On Linux, writing to fresh memory is expensive (page faults, zeroing), and
+//! scattering into many lists is expensive when each push touches several cache
+//! lines. So:
+//!   - all blocks come from one virtual reservation (a lock-free bump pointer,
+//!     2 MB huge pages advised), so any element can also be named by a 32-bit
+//!     reference (its offset from the arena base, in 8-byte words);
+//!   - a `Scatter` keeps only one tail pointer per list on the hot path: a block is
+//!     full when the tail reaches its (block-aligned) end.
+//! Nothing is ever returned to the OS (the process ends soon after).
 
-use std::alloc::{alloc, Layout};
 use std::marker::PhantomData;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// Bytes per block. Every element type stored here is `Copy`, at most 64-byte aligned.
-const BLOCK_BYTES: usize = 64 << 10;
-/// New blocks are carved from 16 MB slabs, 2 MB aligned so the kernel can back
-/// them with 2 MB huge pages (far fewer page faults).
-const SLAB_BLOCKS: usize = 256;
-const SLAB_ALIGN: usize = 2 << 20;
+pub const BLOCK_BYTES: usize = 64 << 10;
+/// Address space reserved for all blocks (only touched pages use memory).
+const ARENA_BYTES: usize = 32 << 30;
 
-/// Free blocks, as addresses (a `usize` is `Send`, a raw pointer is not).
-static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static BASE: AtomicUsize = AtomicUsize::new(0);
+static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-fn take_block() -> *mut u8 {
-    let mut free = POOL.lock().unwrap();
-    if let Some(b) = free.pop() {
-        return b as *mut u8;
+/// Reserve the arena (once, before any block is taken).
+pub fn init() {
+    if BASE.load(Relaxed) != 0 {
+        return;
     }
-    // SAFETY: a non-zero size and a valid power-of-two alignment.
-    let slab = unsafe { alloc(Layout::from_size_align(BLOCK_BYTES * SLAB_BLOCKS, SLAB_ALIGN).unwrap()) };
-    assert!(!slab.is_null(), "out of memory");
+    const ALIGN: usize = 2 << 20;
+    // SAFETY: a fresh private anonymous reservation, never unmapped.
+    let p = unsafe {
+        libc::mmap(std::ptr::null_mut(), ARENA_BYTES + ALIGN, libc::PROT_READ | libc::PROT_WRITE,
+                   libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
+    };
+    assert!(p != libc::MAP_FAILED, "reserve arena");
+    let base = (p as usize + ALIGN - 1) & !(ALIGN - 1);
     // Ask for transparent huge pages (needed where the kernel's THP mode is "madvise").
-    // SAFETY: the range is exactly the slab just allocated; advice never changes its contents.
     #[cfg(target_os = "linux")]
+    // SAFETY: the range lies inside the reservation; advice never changes its contents.
     unsafe {
-        libc::madvise(slab as *mut libc::c_void, BLOCK_BYTES * SLAB_BLOCKS, libc::MADV_HUGEPAGE);
+        libc::madvise(base as *mut libc::c_void, ARENA_BYTES, libc::MADV_HUGEPAGE);
     }
-    free.extend((1..SLAB_BLOCKS).map(|i| slab as usize + i * BLOCK_BYTES));
-    slab
+    BASE.store(base, Relaxed);
 }
 
-/// An append-only list of `T` in pool blocks.
+#[inline]
+fn take_block() -> *mut u8 {
+    let off = NEXT.fetch_add(BLOCK_BYTES, Relaxed);
+    assert!(off + BLOCK_BYTES <= ARENA_BYTES, "arena full");
+    (BASE.load(Relaxed) + off) as *mut u8
+}
+
+/// A 32-bit name for an element in the arena (8-byte aligned, below 32 GB).
+#[inline]
+pub fn ref_of<T>(p: *mut T) -> u32 {
+    ((p as usize - BASE.load(Relaxed)) >> 3) as u32
+}
+
+/// The element a `ref_of` names.
+#[inline]
+pub fn at<T>(r: u32) -> *mut T {
+    (BASE.load(Relaxed) + ((r as usize) << 3)) as *mut T
+}
+
+/// One finished list of `T` (read side).
 pub struct BlockList<T: Copy> {
     blocks: Vec<*mut T>,
-    in_last: usize, // elements in the last block
+    in_last: usize,
     len: usize,
     _t: PhantomData<T>,
 }
@@ -53,27 +76,6 @@ unsafe impl<T: Copy + Sync> Sync for BlockList<T> {}
 
 impl<T: Copy> BlockList<T> {
     const PER_BLOCK: usize = BLOCK_BYTES / std::mem::size_of::<T>();
-
-    pub fn new() -> Self {
-        assert!(std::mem::align_of::<T>() <= 64 && std::mem::size_of::<T>() > 0);
-        BlockList { blocks: Vec::new(), in_last: 0, len: 0, _t: PhantomData }
-    }
-
-    /// Append `v`; returns where it is stored. Blocks never move, so the address
-    /// stays valid until the list is released.
-    #[inline]
-    pub fn push(&mut self, v: T) -> *mut T {
-        if self.blocks.is_empty() || self.in_last == Self::PER_BLOCK {
-            self.blocks.push(take_block() as *mut T);
-            self.in_last = 0;
-        }
-        // SAFETY: the last block has room for PER_BLOCK elements and in_last < PER_BLOCK.
-        let at = unsafe { self.blocks.last().unwrap().add(self.in_last) };
-        unsafe { at.write(v) };
-        self.in_last += 1;
-        self.len += 1;
-        at
-    }
 
     pub fn len(&self) -> usize {
         self.len
@@ -93,12 +95,69 @@ impl<T: Copy> BlockList<T> {
         self.slices().flatten()
     }
 
-    /// Give the blocks back to the pool for later lists. Anything borrowed from
-    /// this list must be gone, which taking `self` by value guarantees.
-    pub fn release(self) {
-        if !self.blocks.is_empty() {
-            POOL.lock().unwrap().extend(self.blocks.iter().map(|&b| b as usize));
+    /// Done with the list (its memory is not reused).
+    pub fn release(self) {}
+}
+
+/// `n` append-only lists written by one thread: one tail pointer per list.
+pub struct Scatter<T: Copy> {
+    tails: Vec<*mut T>,
+    blocks: Vec<Vec<*mut T>>,
+}
+
+// SAFETY: as BlockList.
+unsafe impl<T: Copy + Send> Send for Scatter<T> {}
+
+impl<T: Copy> Scatter<T> {
+    const SIZE: usize = std::mem::size_of::<T>();
+
+    pub fn new(n: usize) -> Self {
+        assert!(std::mem::align_of::<T>() <= 64 && Self::SIZE > 0 && Self::SIZE <= BLOCK_BYTES);
+        assert!(BASE.load(Relaxed) != 0, "blocks::init first");
+        Scatter { tails: vec![std::ptr::null_mut(); n], blocks: (0..n).map(|_| Vec::new()).collect() }
+    }
+
+    /// Append `v` to list `b`; returns where it is stored (stable for the program's life).
+    #[inline(always)]
+    pub fn push(&mut self, b: usize, v: T) -> *mut T {
+        // SAFETY: b < n (callers pass a bucket index); a tail is either null, or
+        // points into its last block with room for one more element unless its
+        // offset in the (block-aligned) block says otherwise.
+        unsafe {
+            let slot = self.tails.get_unchecked_mut(b);
+            let mut t = *slot;
+            let off = t as usize & (BLOCK_BYTES - 1);
+            if off == 0 || off + Self::SIZE > BLOCK_BYTES {
+                t = Self::grow(&mut self.blocks, b);
+            }
+            t.write(v);
+            *self.tails.get_unchecked_mut(b) = t.add(1);
+            t
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(blocks: &mut [Vec<*mut T>], b: usize) -> *mut T {
+        let p = take_block() as *mut T;
+        blocks[b].push(p);
+        p
+    }
+
+    /// The finished lists, one per index.
+    pub fn into_lists(self) -> Vec<BlockList<T>> {
+        self.blocks
+            .into_iter()
+            .zip(self.tails)
+            .map(|(blocks, tail)| {
+                let in_last = match blocks.last() {
+                    Some(&last) => (tail as usize - last as usize) / Self::SIZE,
+                    None => 0,
+                };
+                let len = blocks.len().saturating_sub(1) * BlockList::<T>::PER_BLOCK + in_last;
+                BlockList { blocks, in_last, len, _t: PhantomData }
+            })
+            .collect()
     }
 }
 
@@ -107,23 +166,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn push_iterate_release_reuse() {
-        let mut a: BlockList<u64> = BlockList::new();
-        let n = BlockList::<u64>::PER_BLOCK * 3 + 7;
+    fn push_iterate_refs() {
+        init();
+        let mut s: Scatter<u64> = Scatter::new(3);
+        let n = BLOCK_BYTES / 8 * 3 + 7;
+        let mut last = std::ptr::null_mut();
         for i in 0..n as u64 {
-            a.push(i * 3);
+            last = s.push((i % 2) as usize, i * 3);
         }
-        assert_eq!(a.len(), n);
-        assert!(a.iter().copied().eq((0..n as u64).map(|i| i * 3)));
-        a.release();
-        // A list of another type reuses the blocks and still reads back exactly.
-        let mut b: BlockList<(u32, u16)> = BlockList::new();
-        for i in 0..50_000u32 {
-            b.push((i, (i % 7) as u16));
+        assert_eq!(unsafe { *at::<u64>(ref_of(last)) }, (n as u64 - 1) * 3);
+        let lists = s.into_lists();
+        assert_eq!(lists[0].len() + lists[1].len(), n);
+        assert_eq!(lists[2].len(), 0);
+        assert!(lists[0].iter().copied().eq((0..n as u64).filter(|i| i % 2 == 0).map(|i| i * 3)));
+        assert!(lists[1].iter().copied().eq((0..n as u64).filter(|i| i % 2 == 1).map(|i| i * 3)));
+        // A size that does not divide the block.
+        let mut t: Scatter<[u64; 3]> = Scatter::new(1);
+        for i in 0..50_000u64 {
+            t.push(0, [i, i + 1, i + 2]);
         }
-        assert!(b.iter().copied().eq((0..50_000u32).map(|i| (i, (i % 7) as u16))));
-        let empty: BlockList<u8> = BlockList::new();
-        assert_eq!(empty.iter().count(), 0);
-        empty.release();
+        let l = t.into_lists();
+        assert!(l[0].iter().copied().eq((0..50_000u64).map(|i| [i, i + 1, i + 2])));
     }
 }

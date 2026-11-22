@@ -21,7 +21,7 @@ mod probe;
 use foldhash::fast::FixedState;
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashTable};
-use blocks::BlockList;
+use blocks::{BlockList, Scatter};
 use output::Column;
 use parse::{ts_ms, BAD};
 use rayon::prelude::*;
@@ -87,11 +87,6 @@ fn per_thread<A: Send>(threads: usize, new: impl Fn() -> A, work: impl for<'a> F
     accs.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
-/// One empty list per bucket.
-fn new_lists<T: Copy>() -> Vec<BlockList<T>> {
-    (0..buckets()).map(|_| BlockList::new()).collect()
-}
-
 /// Per-thread lists of every bucket -> per-bucket lists of every thread.
 fn by_bucket<T: Copy>(per_thread: Vec<Vec<BlockList<T>>>) -> Vec<Vec<BlockList<T>>> {
     let mut out: Vec<Vec<BlockList<T>>> = (0..buckets()).map(|_| Vec::with_capacity(per_thread.len())).collect();
@@ -150,20 +145,17 @@ impl PStr {
 struct EventCopy {
     h: u64, // hash of event_id
     event_id: PStr,
+    key: PKey, // the person's 64-bit identity
     person: PStr,
-    key: PersonKey, // the person's 128-bit identity
-    ts: i64,
-    ingest: i64,
-    price: i32,
-    category: u16,
-    event_type: u8,
+    ts: u32,     // ms after window_start (only when ok)
+    ingest: u32, // see `ingest_code`
+    pay: u32,    // see `pay`
     ok: bool,
 }
 
-const _: () = assert!(std::mem::size_of::<EventCopy>() == 64);
-const _: () = assert!(std::mem::size_of::<Dup>() == 32);
-const _: () = assert!(std::mem::size_of::<Event>() == 40);
-const _: () = assert!(std::mem::size_of::<Click>() == 40);
+const _: () = assert!(std::mem::size_of::<Dup>() == 24);
+const _: () = assert!(std::mem::size_of::<Event>() == 24);
+const _: () = assert!(std::mem::size_of::<Click>() == 24);
 
 /// What parsing an event needs: the window and the lookups.
 struct Lookups<'a> {
@@ -174,73 +166,101 @@ struct Lookups<'a> {
     unknown: u16,
 }
 
-/// A valid event copy, with its person. `dead`: dedup chose another copy of
-/// its event_id (set by pass 2), so it doesn't count.
+/// A person's identity in the records: the first 64 bits of the XXH3-128 hash of
+/// their name. Two different names share it about once in 10^7 runs at 60M events.
+type PKey = u64;
+
+/// price_cents (24 bits; 0 unless a purchase, whose price is 1..=10^7), the
+/// category (7 bits; only for purchases) and, in bit 31, "dead" (dedup chose
+/// another copy of the event_id).
+#[inline]
+fn pay(price: u32, category: u16) -> u32 {
+    price | (category as u32) << 24
+}
+const DEAD: u32 = 1 << 31;
+
+/// ingest_ts in whole seconds (it is always F1), offset so that every instant
+/// within 68 years of the window fits; only ever compared with another copy's.
+#[inline]
+fn ingest_code(ms: i64, start: i64) -> u32 {
+    (ms.div_euclid(1000) - start.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32
+}
+
+/// A valid event copy, with its person (24 bytes).
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Event {
+    key: PKey,
     person: PStr,
-    key: PersonKey, // the person's 128-bit identity
-    ts: i64,
-    price: i32,
-    category: u16,
-    event_type: u8,
-    dead: u8,
+    ts: u32, // ms after window_start
+    pay: u32,
 }
 
 /// What dedup needs of one event copy (valid or not): its event_id, ingest_ts,
-/// and where its Event is (0 if the copy isn't valid and has none).
+/// and where its Event is (NO_EVENT if the copy isn't valid and has none).
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Dup {
     h: u64, // hash of event_id
     event_id: PStr,
-    ingest: i64,
-    event: usize, // *mut Event, as an address
+    ingest: u32,
+    event: u32, // blocks::ref_of the Event
 }
+const NO_EVENT: u32 = u32::MAX;
 
 /// Mark the Event of a copy that dedup did not keep.
 #[inline]
 fn kill(d: &Dup) {
-    if d.event != 0 {
-        // SAFETY: `event` is the address `BlockList::push` returned for this copy's
-        // Event; its list lives (unreleased, unborrowed) until the person pass, and
-        // each copy is in exactly one dedup bucket, so no other thread writes it.
-        unsafe { std::ptr::addr_of_mut!((*(d.event as *mut Event)).dead).write(1) };
+    if d.event != NO_EVENT {
+        // SAFETY: `event` names the Event `Scatter::push` stored for this copy; its
+        // list lives until the person pass, and each copy is in exactly one dedup
+        // bucket, so no other thread writes it.
+        unsafe {
+            let e = blocks::at::<Event>(d.event);
+            std::ptr::addr_of_mut!((*e).pay).write((*e).pay | DEAD);
+        }
     }
 }
 
 /// Each worker thread's lists from pass 1, one per bucket.
 struct ParseLists {
-    dups: Vec<BlockList<Dup>>,
-    events: Vec<BlockList<Event>>,
-    clicks: Vec<BlockList<Click>>,
+    dups: Scatter<Dup>,
+    events: Scatter<Event>,
+    clicks: Scatter<Click>,
 }
 
 impl ParseLists {
     fn new() -> ParseLists {
-        ParseLists { dups: new_lists(), events: new_lists(), clicks: new_lists() }
+        ParseLists { dups: Scatter::new(buckets()), events: Scatter::new(buckets()), clicks: Scatter::new(buckets()) }
     }
 
     /// File one parsed event copy: its event (if valid) by person, its dedup record by event_id.
     #[inline]
     fn add(&mut self, c: EventCopy) {
         let event = if c.ok {
-            self.events[bucket(c.key.0)].push(Event {
-                person: c.person, key: c.key, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type, dead: 0,
-            }) as usize
+            blocks::ref_of(self.events.push(bucket(c.key), Event { key: c.key, person: c.person, ts: c.ts, pay: c.pay }))
         } else {
-            0
+            NO_EVENT
         };
-        self.dups[bucket(c.h)].push(Dup { h: c.h, event_id: c.event_id, ingest: c.ingest, event });
+        self.dups.push(bucket(c.h), Dup { h: c.h, event_id: c.event_id, ingest: c.ingest, event });
     }
 }
 
-/// A valid click, with its person.
+/// A valid click, with its person (24 bytes).
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Click {
-    key: PersonKey, // the person's 128-bit identity
-    ts: i64,
+    key: PKey,
     click_id: PStr,
+    ts: u32, // ms after window_start - 7 days
     campaign: u32,
+}
+
+/// hashbrown takes a slot's 7-bit tag from the hash's top bits, which within one
+/// bucket are all the same (they chose the bucket): give it other bits.
+#[inline]
+fn table_hash(h: u64) -> u64 {
+    h.rotate_right(32)
 }
 
 /// One user_daily row.
@@ -281,25 +301,27 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
         && price.is_some()
         && ingest - ts <= DAY; // late: strictly over 24 h (ts is in the window here, so no overflow)
     // The person is filled in later (`finish_event`), once its table slot has had
-    // time to arrive in cache: here only the key is computed and the slot prefetched.
-    let (key, maybe_linked, category) = if ok {
-        let key = key_of(user_id);
-        let maybe = lk.links.prefetch(key);
-        let category = if event_type == PURCHASE {
-            lk.product_category.get(product_id).copied().unwrap_or(lk.unknown)
+    // time to arrive in cache: here only the ID's key is computed and the slot prefetched.
+    let (id_key, maybe_linked, pay_bits) = if ok {
+        let id_key = key_of(user_id);
+        let maybe = lk.links.prefetch(id_key);
+        let pay_bits = if event_type == PURCHASE {
+            let category = lk.product_category.get(product_id).copied().unwrap_or(lk.unknown);
+            pay(price.unwrap_or(0) as u32, category)
         } else {
             0
         };
-        (key, maybe, category)
+        (id_key, maybe, pay_bits)
     } else {
         (NO_KEY, false, 0)
     };
     Some(Pending {
         copy: EventCopy {
-            h: hash(event_id), event_id: PStr::new(event_id), person: PStr(0), key, ts, ingest,
-            price: price.unwrap_or(0) as i32, category, event_type, ok,
+            h: hash(event_id), event_id: PStr::new(event_id), key: 0, person: PStr(0),
+            ts: if ok { (ts - start) as u32 } else { 0 }, ingest: ingest_code(ingest, start), pay: pay_bits, ok,
         },
         user_id,
+        id_key,
         maybe_linked,
     })
 }
@@ -309,6 +331,7 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<Pending> {
 struct Pending {
     copy: EventCopy,
     user_id: Str,
+    id_key: PersonKey,
     maybe_linked: bool,
 }
 
@@ -316,8 +339,8 @@ struct Pending {
 fn finish_event(p: Pending, links: &Links) -> EventCopy {
     let mut c = p.copy;
     if c.ok {
-        let (person, key) = links.resolve(p.user_id, c.key, p.maybe_linked);
-        c.person = PStr::new(person);
+        let (person, key) = links.resolve(p.user_id, p.id_key, p.maybe_linked);
+        c.person = person;
         c.key = key;
     }
     c
@@ -339,7 +362,7 @@ fn knob(name: &str, default: usize) -> usize {
 #[derive(Clone, Copy)]
 struct LinkSlot {
     id: PersonKey, // (0, 0) marks an empty slot; a real (0, 0) key is kept apart
-    person: PersonKey,
+    person: PKey,
     name: PStr,
 }
 
@@ -354,7 +377,7 @@ struct LinkPart {
 impl LinkPart {
     fn build(entries: &[LinkSlot]) -> LinkPart {
         let cap = (entries.len() * 2).max(16).next_power_of_two();
-        let mut slots = vec![LinkSlot { id: NO_KEY, person: NO_KEY, name: PStr(0) }; cap];
+        let mut slots = vec![LinkSlot { id: NO_KEY, person: 0, name: PStr(0) }; cap];
         for e in entries {
             let mut i = e.id.0 as usize & (cap - 1);
             while slots[i].id != NO_KEY {
@@ -418,7 +441,7 @@ fn link_part(key: PersonKey) -> usize {
 struct Links {
     parts: Vec<LinkPart>,
     /// The person of a linked ID whose key is (0, 0), if there is one.
-    zero: Option<(PStr, PersonKey)>,
+    zero: Option<(PStr, PKey)>,
     /// A Bloom filter of every linked ID's key: 8+ bits per ID, 2 bits set each.
     /// A clear bit means "in no link" for sure, so most one-ID people skip the
     /// big table (which at 20M is far larger than a Xeon core's cache).
@@ -441,13 +464,13 @@ impl Links {
         (self.bloom[a / 64] >> (a % 64)) & (self.bloom[b / 64] >> (b % 64)) & 1 == 1
     }
 
-    /// The person an ID belongs to, and the person's key. An ID in no link is a
-    /// person on its own, named by itself. IDs are matched by their 128-bit key.
+    /// The person an ID belongs to: their key. An ID in no link is a person on
+    /// its own, named by itself. IDs are matched by their 128-bit key.
     #[inline]
-    fn person_of(&self, id: Str) -> (Str, PersonKey) {
+    fn person_of(&self, id: Str) -> PKey {
         let key = key_of(id);
         let maybe = self.maybe_linked(key);
-        self.resolve(id, key, maybe)
+        self.resolve(id, key, maybe).1
     }
 
     /// Start loading the table slot a key will need (when the Bloom filter says
@@ -461,18 +484,19 @@ impl Links {
         maybe
     }
 
+    /// The person's name and key.
     #[inline]
-    fn resolve(&self, id: Str, key: PersonKey, maybe_linked: bool) -> (Str, PersonKey) {
-        if !maybe_linked {
-            return (id, key);
+    fn resolve(&self, id: Str, key: PersonKey, maybe_linked: bool) -> (PStr, PKey) {
+        if maybe_linked {
+            if key == NO_KEY {
+                if let Some(z) = self.zero {
+                    return z;
+                }
+            } else if let Some(e) = self.parts[link_part(key)].find(key) {
+                return (e.name, e.person);
+            }
         }
-        if key == NO_KEY {
-            return self.zero.map_or((id, key), |(n, k)| (n.get(), k));
-        }
-        match self.parts[link_part(key)].find(key) {
-            Some(e) => (e.name.get(), e.person),
-            None => (id, key),
-        }
+        (PStr::new(id), key.0) // the key of a name is the first half of its 128-bit hash
     }
 }
 
@@ -606,7 +630,7 @@ fn person_names(links_dir: &Path) -> Links {
             numbered[p].0.iter().enumerate().map(|(local, &k)| {
                 let g = offset[p] as usize + local;
                 let name = ids[best[roots[g] as usize].load(Relaxed) as usize];
-                LinkSlot { id: k, person: key_of(name), name: PStr::new(name) }
+                LinkSlot { id: k, person: key_of(name).0, name: PStr::new(name) }
             }).collect()
         })
         .collect();
@@ -700,6 +724,7 @@ struct Session {
 
 /// Everything the person pass needs to know about the inputs.
 struct Context {
+    start: i64,
     base_day: i64,
     days: usize,
     campaigns: usize,
@@ -710,22 +735,23 @@ struct Context {
 
 /// Events rules 5-7 and clicks rules 4-7 for the people of one bucket.
 ///
-/// People are numbered by their 128-bit key (no name is read), then events and clicks are
+/// People are numbered by their key (no name is read), then events and clicks are
 /// placed person by person with a counting sort (two linear passes), so the
-/// only sorting left is by time within each person.
+/// only sorting left is by time within each person. Times here are ms after
+/// window_start (clicks may be up to a week before it, so they are negative).
 fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &Context, tally: &mut Tally, users: &mut Users) {
     let n_copies: usize = events.iter().map(|l| l.len()).sum();
-    let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_copies / 4 + 16);
-    let mut names: Vec<Str> = Vec::new();
+    let mut number: HashTable<(PKey, u32)> = HashTable::with_capacity(n_copies / 4 + 16);
+    let mut names: Vec<PStr> = Vec::new();
     let mut counts: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = Vec::with_capacity(n_copies);
-    let live = || events.iter().flat_map(|l| l.iter()).filter(|e| e.dead == 0);
+    let live = || events.iter().flat_map(|l| l.iter()).filter(|e| e.pay & DEAD == 0);
     for e in live() {
-        let id = match number.entry(e.key.0, |&(k, _)| k == e.key, |x| x.0.0) {
+        let id = match number.entry(table_hash(e.key), |&(k, _)| k == e.key, |x| table_hash(x.0)) {
             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
             hashbrown::hash_table::Entry::Vacant(v) => {
                 v.insert((e.key, names.len() as u32));
-                names.push(e.person.get());
+                names.push(e.person);
                 counts.push(0);
                 (names.len() - 1) as u32
             }
@@ -734,16 +760,16 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
         ids.push(id);
     }
     let people = names.len();
-    // Counting sort of events by person: (ts, price, category, event_type).
+    // Counting sort of events by person: ts << 32 | pay, so sorting sorts by time.
     let mut ev_at = vec![0u32; people + 1];
     for p in 0..people {
         ev_at[p + 1] = ev_at[p] + counts[p];
     }
     let mut fill: Vec<u32> = ev_at[..people].to_vec();
-    let mut evs: Vec<(i64, i32, u16, u8)> = vec![(0, 0, 0, 0); ids.len()];
+    let mut evs: Vec<u64> = vec![0; ids.len()];
     for (e, &id) in live().zip(&ids) {
         let at = &mut fill[id as usize];
-        evs[*at as usize] = (e.ts, e.price, e.category, e.event_type);
+        evs[*at as usize] = (e.ts as u64) << 32 | e.pay as u64;
         *at += 1;
     }
     drop(ids);
@@ -752,7 +778,7 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
     let flat_clicks: Vec<&Click> = clicks.iter().flat_map(|l| l.iter()).collect();
     let mut ck_count = vec![0u32; people];
     for (k, c) in flat_clicks.iter().enumerate() {
-        if let Some(&(_, id)) = number.find(c.key.0, |&(k, _)| k == c.key) {
+        if let Some(&(_, id)) = number.find(table_hash(c.key), |&(k, _)| k == c.key) {
             ck_count[id as usize] += 1;
             click_ids.push((id, k as u32));
         }
@@ -766,12 +792,13 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
     for &(id, k) in &click_ids {
         let c = flat_clicks[k as usize];
         let at = &mut fill[id as usize];
-        cks[*at as usize] = (c.ts, c.click_id.get(), c.campaign);
+        cks[*at as usize] = (c.ts as i64 - WEEK, c.click_id.get(), c.campaign);
         *at += 1;
     }
     drop(click_ids);
 
     let organic = cx.campaigns;
+    let day_of = |t: i64| ((cx.start + t).div_euclid(DAY) - cx.base_day) as usize;
     let mut sessions: Vec<Session> = Vec::new();
     let mut runs: Vec<(u32, i64)> = Vec::new();
     let mut starts: Vec<i64> = Vec::new();
@@ -779,21 +806,24 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
     let mut spend = vec![0i64; cx.categories];
     for p in 0..people {
         let evs = &mut evs[ev_at[p] as usize..ev_at[p + 1] as usize];
-        evs.sort_unstable_by_key(|e| e.0);
+        evs.sort_unstable();
         // Rule 5: a new session where the gap from the previous event is over 30 min.
         // Equal timestamps have a gap of 0, so they always share a session.
         sessions.clear();
         let mut prev = i64::MIN;
         let mut row: Option<UserRow> = None;
-        for &(ts, price, category, event_type) in evs.iter() {
-            let price = price as i64;
+        let name = names[p].get();
+        for &v in evs.iter() {
+            let ts = (v >> 32) as i64;
+            let price = (v & 0xFF_FFFF) as i64; // 0 unless a purchase
+            let category = ((v >> 24) & 0x7F) as usize;
             if sessions.is_empty() || ts - prev > SESSION_GAP {
-                let day = (ts.div_euclid(DAY) - cx.base_day) as usize; // rule 6: the start's UTC date
+                let day = day_of(ts); // rule 6: the start's UTC date
                 if row.as_ref().is_some_and(|r| r.day as i64 != cx.base_day + day as i64) {
                     users.push(finish_row(row.take().unwrap(), &mut spend, cx));
                 }
                 let r = row.get_or_insert(UserRow {
-                    person: names[p],
+                    person: name,
                     day: (cx.base_day + day as i64) as i32,
                     sessions: 0,
                     events: 0,
@@ -806,9 +836,9 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
             prev = ts;
             let r = row.as_mut().unwrap();
             r.events += 1;
-            if event_type == PURCHASE {
+            if price > 0 {
                 r.revenue += price;
-                spend[category as usize] += price;
+                spend[category] += price;
                 let s = sessions.last_mut().unwrap();
                 s.purchases += 1;
                 s.revenue += price;
@@ -924,6 +954,9 @@ fn run() {
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
 
     let (start, end) = window(&data);
+    // Times are stored as u32 ms after window_start (clicks: after window_start - 7 days).
+    assert!(end > start && end - start + WEEK < 1 << 32, "window too long for 32-bit offsets");
+    blocks::init();
     let base_day = start.div_euclid(DAY);
     let days = ((end - 1).div_euclid(DAY) - base_day + 1) as usize;
 
@@ -941,6 +974,7 @@ fn run() {
     }
     let unknown = category_names.len() as u16;
     category_names.push(b"unknown");
+    assert!(category_names.len() <= 128, "categories are stored in 7 bits");
     let mut category_order: Vec<u16> = (0..category_names.len() as u16).collect();
     category_order.sort_by_key(|&c| category_names[c as usize]);
 
@@ -964,7 +998,6 @@ fn run() {
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let chunk_bytes = knob("SHOPPING_CHUNK_KB", CHUNK_BYTES >> 10) << 10;
     let depth = knob("SHOPPING_PIPELINE", PIPELINE).clamp(1, PIPELINE_MAX);
-    let click_depth = knob("SHOPPING_CLICK_PIPELINE", 0).min(PIPELINE_MAX);
     let event_chunks = input::dir_chunks(&data.join("events"), chunk_bytes);
     // 256 buckets, or 1024 for inputs over 1 GB of events (~10M+), so each
     // bucket's dedup table (~20k events at 20M) fits a Xeon core's L2. Attempt #6
@@ -988,10 +1021,6 @@ fn run() {
         work.par_iter().for_each(|&(is_click, chunk)| {
             let mut b = acc();
             if is_click {
-                // Optionally (SHOPPING_CLICK_PIPELINE=N, probes only) the linked-ID slot
-                // is prefetched and the click waits N clicks before its lookup, like events.
-                let mut ring: [Option<(Str, PersonKey, bool, Click)>; PIPELINE_MAX] = [None; PIPELINE_MAX];
-                let mut at = 0;
                 input::for_each_record::<4>(chunk, |rec| {
                     let Some([click_id, user_id, campaign, ts]) = rec else { return };
                     if click_id.is_empty() || user_id.is_empty() {
@@ -1002,26 +1031,10 @@ fn run() {
                         return; // the click window, a week longer than the event window
                     }
                     let Some(&campaign) = campaign_index.get(campaign) else { return };
-                    if click_depth == 0 {
-                        let (_, key) = links.person_of(user_id);
-                        b.clicks[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
-                        return;
-                    }
-                    let key = key_of(user_id);
-                    let maybe = links.prefetch(key);
-                    let c = Click { key, ts, click_id: PStr::new(click_id), campaign };
-                    if let Some((id, k, m, mut old)) = ring[at].replace((user_id, key, maybe, c)) {
-                        old.key = links.resolve(id, k, m).1;
-                        b.clicks[bucket(old.key.0)].push(old);
-                    }
-                    at = if at + 1 == click_depth { 0 } else { at + 1 };
+                    let key = links.person_of(user_id);
+                    let ts = (ts - (start - WEEK)) as u32;
+                    b.clicks.push(bucket(key), Click { key, click_id: PStr::new(click_id), ts, campaign });
                 });
-                for slot in ring.iter_mut() {
-                    if let Some((id, k, m, mut old)) = slot.take() {
-                        old.key = links.resolve(id, k, m).1;
-                        b.clicks[bucket(old.key.0)].push(old);
-                    }
-                }
                 return;
             }
             let mut ring: [Option<Pending>; PIPELINE_MAX] = [None; PIPELINE_MAX];
@@ -1051,16 +1064,16 @@ fn run() {
     let mut events = Vec::with_capacity(threads);
     let mut clicks = Vec::with_capacity(threads);
     for l in lists {
-        dups.push(l.dups);
-        events.push(l.events);
-        clicks.push(l.clicks);
+        dups.push(l.dups.into_lists());
+        events.push(l.events.into_lists());
+        clicks.push(l.clicks.into_lists());
     }
     by_bucket(dups).into_par_iter().for_each(|lists| {
         let n: usize = lists.iter().map(|l| l.len()).sum();
         let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
         let mut kept: Vec<&Dup> = Vec::with_capacity(n);
         for d in lists.iter().flat_map(|l| l.iter()) {
-            match first.entry(d.h, |&(h, k)| h == d.h && kept[k as usize].event_id.same(d.event_id), |e| e.0) {
+            match first.entry(table_hash(d.h), |&(h, k)| h == d.h && kept[k as usize].event_id.same(d.event_id), |e| table_hash(e.0)) {
                 hashbrown::hash_table::Entry::Occupied(e) => {
                     let k = e.get().1 as usize;
                     if d.ingest < kept[k].ingest {
@@ -1086,7 +1099,7 @@ fn run() {
     // Pass 3: per person bucket, in groups of buckets. Each group writes its own
     // user_daily parts as soon as it is done, so writing overlaps the other
     // groups' work instead of running after all of them.
-    let cx = Context { base_day, days, campaigns, categories: category_names.len(), category_order };
+    let cx = Context { start, base_day, days, campaigns, categories: category_names.len(), category_order };
     let checksum = std::env::var("SHOPPING_CHECKSUM").is_ok();
     // SHOPPING_CHECKSUM=1: an order-independent checksum of both tables, so a
     // probe can check on the scorer that two builds wrote the same rows.
