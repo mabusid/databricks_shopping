@@ -326,6 +326,13 @@ fn finish_event(p: Pending, links: &Links) -> EventCopy {
 /// How many parsed copies wait before their person is looked up: enough lines
 /// for a prefetched table slot to arrive from memory.
 const PIPELINE: usize = 8;
+/// The most copies the ring can hold (SHOPPING_PIPELINE may set 1..=32, only for probes).
+const PIPELINE_MAX: usize = 32;
+
+/// A tuning knob from the environment (only probes set these), else `default`.
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 /// One linked ID: its key, and its person's name and key, all in one 40-byte
 /// slot so a lookup is one (prefetchable) memory access.
@@ -947,7 +954,10 @@ fn run() {
 
     // Event chunks, and the bucket count.
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
-    let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
+    let chunk_bytes = knob("SHOPPING_CHUNK_KB", CHUNK_BYTES >> 10) << 10;
+    let depth = knob("SHOPPING_PIPELINE", PIPELINE).clamp(1, PIPELINE_MAX);
+    let click_depth = knob("SHOPPING_CLICK_PIPELINE", 0).min(PIPELINE_MAX);
+    let event_chunks = input::dir_chunks(&data.join("events"), chunk_bytes);
     // 256 buckets, or 1024 for inputs over 1 GB of events (~10M+), so each
     // bucket's dedup table (~20k events at 20M) fits a Xeon core's L2. Attempt #6
     // tried 2048 with growing Vecs and was slower (the scatter into fresh,
@@ -963,13 +973,17 @@ fn run() {
     // on the input size. Clicks: copies of a click are identical, so dedup can
     // change neither credit (same ts and click_id) nor assists (each campaign
     // counts once): it is skipped.
-    let click_chunks = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES);
+    let click_chunks = input::dir_chunks(&data.join("clicks"), chunk_bytes);
     let work: Vec<(bool, &'static [u8])> =
         event_chunks.iter().map(|&c| (false, c)).chain(click_chunks.iter().map(|&c| (true, c))).collect();
     let lists: Vec<ParseLists> = per_thread(threads, ParseLists::new, |acc| {
         work.par_iter().for_each(|&(is_click, chunk)| {
             let mut b = acc();
             if is_click {
+                // Optionally (SHOPPING_CLICK_PIPELINE=N, probes only) the linked-ID slot
+                // is prefetched and the click waits N clicks before its lookup, like events.
+                let mut ring: [Option<(Str, PersonKey, bool, Click)>; PIPELINE_MAX] = [None; PIPELINE_MAX];
+                let mut at = 0;
                 input::for_each_record::<4>(chunk, |rec| {
                     let Some([click_id, user_id, campaign, ts]) = rec else { return };
                     if click_id.is_empty() || user_id.is_empty() {
@@ -980,23 +994,40 @@ fn run() {
                         return; // the click window, a week longer than the event window
                     }
                     let Some(&campaign) = campaign_index.get(campaign) else { return };
-                    let (_, key) = links.person_of(user_id);
-                    b.clicks[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
+                    if click_depth == 0 {
+                        let (_, key) = links.person_of(user_id);
+                        b.clicks[bucket(key.0)].push(Click { key, ts, click_id: PStr::new(click_id), campaign });
+                        return;
+                    }
+                    let key = key_of(user_id);
+                    let maybe = links.prefetch(key);
+                    let c = Click { key, ts, click_id: PStr::new(click_id), campaign };
+                    if let Some((id, k, m, mut old)) = ring[at].replace((user_id, key, maybe, c)) {
+                        old.key = links.resolve(id, k, m).1;
+                        b.clicks[bucket(old.key.0)].push(old);
+                    }
+                    at = if at + 1 == click_depth { 0 } else { at + 1 };
                 });
+                for slot in ring.iter_mut() {
+                    if let Some((id, k, m, mut old)) = slot.take() {
+                        old.key = links.resolve(id, k, m).1;
+                        b.clicks[bucket(old.key.0)].push(old);
+                    }
+                }
                 return;
             }
-            let mut ring: [Option<Pending>; PIPELINE] = [None; PIPELINE];
+            let mut ring: [Option<Pending>; PIPELINE_MAX] = [None; PIPELINE_MAX];
             let mut at = 0;
             input::for_each_record::<7>(chunk, |rec| {
                 if let Some(p) = rec.and_then(|f| parse_event(f, &lookups)) {
                     if let Some(old) = ring[at].replace(p) {
                         b.add(finish_event(old, &links));
                     }
-                    at = (at + 1) % PIPELINE;
+                    at = if at + 1 == depth { 0 } else { at + 1 };
                 }
             });
-            for k in 0..PIPELINE {
-                if let Some(old) = ring[(at + k) % PIPELINE].take() {
+            for k in 0..depth {
+                if let Some(old) = ring[(at + k) % depth].take() {
                     b.add(finish_event(old, &links));
                 }
             }
