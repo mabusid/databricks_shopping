@@ -194,7 +194,6 @@ fn parse_event(fields: [Str; 7], lk: &Lookups) -> Option<EventCopy> {
     })
 }
 
-/// Each linked ID's person: the name and its hash.
 /// One linked ID: its key, and its person's name and key, all in the table
 /// entry so a lookup is one memory access.
 struct LinkEntry {
@@ -203,8 +202,16 @@ struct LinkEntry {
     person: PersonKey,
 }
 
+/// The linked IDs are split into this many parts by key, so building them runs in parallel.
+const LINK_PARTS: usize = 64;
+
+#[inline]
+fn link_part(key: PersonKey) -> usize {
+    (key.1 >> 58) as usize // hash2's top bits: the tables hash by key.0
+}
+
 struct Links {
-    table: HashTable<LinkEntry>,
+    parts: Vec<HashTable<LinkEntry>>,
 }
 
 impl Links {
@@ -213,7 +220,7 @@ impl Links {
     #[inline]
     fn person_of(&self, id: Str) -> (Str, PersonKey) {
         let key = key_of(id);
-        match self.table.find(key.0, |e| e.id == key) {
+        match self.parts[link_part(key)].find(key.0, |e| e.id == key) {
             Some(e) => (e.name, e.person),
             None => (id, key),
         }
@@ -222,7 +229,14 @@ impl Links {
 
 /// Linked IDs rules 1-3: for every ID in a kept link line, the person's name
 /// (the byte-wise smallest ID joined to it, however many links apart).
+/// Every step runs in parallel:
+///   1. number the distinct IDs, part by part (IDs matched by key);
+///   2. join them with a lock-free union-find (a root is only ever linked under
+///      a smaller root, so the parent links can never form a loop);
+///   3. pick each person's byte-wise smallest ID, with an atomic compare-and-swap;
+///   4. build each part's lookup table.
 fn person_names(links_dir: &Path) -> Links {
+    use std::sync::atomic::{AtomicU32, Ordering::{AcqRel, Acquire, Relaxed}};
     let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, CHUNK_BYTES)
         .par_iter()
         .flat_map_iter(|&chunk| {
@@ -237,46 +251,120 @@ fn person_names(links_dir: &Path) -> Links {
             pairs
         })
         .collect();
-    let mut index: Map<Str, u32> = Map::with_capacity_and_hasher(pairs.len() * 2, hasher());
-    let mut ids: Vec<Str> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    let mut intern = |id: Str, ids: &mut Vec<Str>, parent: &mut Vec<u32>| -> u32 {
-        *index.entry(id).or_insert_with(|| {
-            ids.push(id);
-            parent.push(parent.len() as u32);
-            (ids.len() - 1) as u32
+    let side = |o: u32| -> Str { let (a, b) = pairs[(o / 2) as usize]; if o % 2 == 0 { a } else { b } };
+
+    // 1. Each occurrence o = 2 * pair + side goes to its ID's part; each part numbers its IDs.
+    const CHUNK: usize = 4096;
+    let threads = rayon::current_num_threads();
+    let scattered: Vec<Vec<Vec<(PersonKey, u32)>>> =
+        per_thread(threads, || (0..LINK_PARTS).map(|_| Vec::new()).collect::<Vec<Vec<_>>>(), |acc| {
+            pairs.par_chunks(CHUNK).enumerate().for_each(|(ci, chunk)| {
+                let mut b = acc();
+                for (j, &(x, y)) in chunk.iter().enumerate() {
+                    let o = ((ci * CHUNK + j) * 2) as u32;
+                    for (k, occ) in [(key_of(x), o), (key_of(y), o + 1)] {
+                        b[link_part(k)].push((k, occ));
+                    }
+                }
+            });
+        });
+    // Per part: the distinct keys, the first occurrence of each, and every occurrence's number.
+    let numbered: Vec<(Vec<PersonKey>, Vec<u32>, Vec<(u32, u32)>)> = (0..LINK_PARTS)
+        .into_par_iter()
+        .map(|p| {
+            let mut table: HashTable<(PersonKey, u32)> = HashTable::new();
+            let (mut keys, mut first, mut numbers) = (Vec::new(), Vec::new(), Vec::new());
+            for &(k, o) in scattered.iter().flat_map(|t| &t[p]) {
+                let local = match table.entry(k.0, |e| e.0 == k, |e| e.0.0) {
+                    hashbrown::hash_table::Entry::Occupied(e) => e.get().1,
+                    hashbrown::hash_table::Entry::Vacant(v) => {
+                        v.insert((k, keys.len() as u32));
+                        keys.push(k);
+                        first.push(o);
+                        (keys.len() - 1) as u32
+                    }
+                };
+                numbers.push((o, local));
+            }
+            (keys, first, numbers)
         })
-    };
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let up = parent[parent[x as usize] as usize];
-            parent[x as usize] = up; // path halving
-            x = up;
+        .collect();
+    let mut offset = vec![0u32; LINK_PARTS + 1];
+    for p in 0..LINK_PARTS {
+        offset[p + 1] = offset[p] + numbered[p].0.len() as u32;
+    }
+    let n = offset[LINK_PARTS] as usize;
+    let number: Vec<AtomicU32> = (0..pairs.len() * 2).map(|_| AtomicU32::new(0)).collect();
+    numbered.par_iter().enumerate().for_each(|(p, (_, _, numbers))| {
+        for &(o, local) in numbers {
+            number[o as usize].store(offset[p] + local, Relaxed);
         }
-        x
-    }
-    for &(a, b) in &pairs {
-        let ia = intern(a, &mut ids, &mut parent);
-        let ib = intern(b, &mut ids, &mut parent);
-        let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-        if ra != rb {
-            parent[ra as usize] = rb;
+    });
+    let ids: Vec<Str> = numbered
+        .par_iter()
+        .map(|(_, first, _)| first.iter().map(|&o| side(o)).collect::<Vec<Str>>())
+        .collect::<Vec<_>>()
+        .concat();
+
+    // 2. Union-find.
+    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
+        loop {
+            let p = parent[x as usize].load(Acquire);
+            if p == x {
+                return x;
+            }
+            let g = parent[p as usize].load(Acquire);
+            if g != p {
+                let _ = parent[x as usize].compare_exchange_weak(p, g, AcqRel, Acquire); // path halving
+            }
+            x = p;
         }
     }
-    let roots: Vec<u32> = (0..ids.len() as u32).map(|i| find(&mut parent, i)).collect();
-    let mut name: Vec<Str> = vec![&[]; ids.len()];
-    for (i, &r) in roots.iter().enumerate() {
-        let r = r as usize;
-        if name[r].is_empty() || ids[i] < name[r] {
-            name[r] = ids[i]; // byte-wise smallest ID of the person
+    (0..pairs.len()).into_par_iter().for_each(|i| {
+        let (a, b) = (number[2 * i].load(Relaxed), number[2 * i + 1].load(Relaxed));
+        loop {
+            let (ra, rb) = (find(&parent, a), find(&parent, b));
+            if ra == rb {
+                break;
+            }
+            let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
+            if parent[hi as usize].compare_exchange(hi, lo, AcqRel, Acquire).is_ok() {
+                break;
+            }
         }
-    }
-    let mut table = HashTable::with_capacity(ids.len());
-    for (&id, &r) in ids.iter().zip(&roots) {
-        let (key, name) = (key_of(id), name[r as usize]);
-        table.insert_unique(key.0, LinkEntry { id: key, name, person: key_of(name) }, |e: &LinkEntry| e.id.0);
-    }
-    Links { table }
+    });
+    let roots: Vec<u32> = (0..n as u32).into_par_iter().map(|i| find(&parent, i)).collect();
+
+    // 3. Each person's byte-wise smallest ID (distinct IDs never have equal bytes).
+    const NONE: u32 = u32::MAX;
+    let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NONE)).collect();
+    (0..n as u32).into_par_iter().for_each(|i| {
+        let slot = &best[roots[i as usize] as usize];
+        let mut cur = slot.load(Acquire);
+        while cur == NONE || ids[i as usize] < ids[cur as usize] {
+            match slot.compare_exchange_weak(cur, i, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
+    });
+
+    // 4. The lookup tables.
+    let parts: Vec<HashTable<LinkEntry>> = (0..LINK_PARTS)
+        .into_par_iter()
+        .map(|p| {
+            let keys = &numbered[p].0;
+            let mut table = HashTable::with_capacity(keys.len());
+            for (local, &k) in keys.iter().enumerate() {
+                let g = offset[p] as usize + local;
+                let name = ids[best[roots[g] as usize].load(Relaxed) as usize];
+                table.insert_unique(k.0, LinkEntry { id: k, name, person: key_of(name) }, |e: &LinkEntry| e.id.0);
+            }
+            table
+        })
+        .collect();
+    Links { parts }
 }
 
 fn window(data: &Path) -> (i64, i64) {

@@ -13,6 +13,19 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Linked IDs built in parallel
+- **Context:** The linked-ID stage ran on one thread while the other 7 waited. At 3M it took ~21 ms (parse 2.6 ms, interning + union 10.7 ms, names + table 8.2 ms), so probably ~0.15 s locally at 20M and more on the scorer
+- **Options:** A) Parallelize every step. B) Overlap it with event parsing (that would mean resolving persons after parsing, which earlier measured slower)
+- **Chose:** A. IDs go to 64 parts by their 128-bit key and are numbered per part, then:
+  - Joined with a lock-free union-find: compare-and-swap links a root only under a smaller root, so no loops; path halving
+  - Each person's byte-wise smallest ID is chosen with an atomic compare-and-swap
+  - One lookup table is built per part
+- **Pros:**
+  - 3M events: the stage drops 0.020 → 0.010 s (whole run ~0.285 → ~0.238 s)
+- **Cons / risks:**
+  - Lock-free code depends on thread timing. Checked by 8 repeated runs with identical output on 3M, plus 36/36 fixtures, the dev answer and Rust = Polars on 10 seeds
+- **Result:** — (attempt #9 pending)
+
 ## Back to 256 buckets
 - **Context:** Attempt #6 scaled buckets with the input (2048 at 20M) and was slower, 3.4492 → 3.5092 s. The scorer is consistent (the two Polars runs were 0.01 s apart), so the loss is real
 - **Options:** A) A fixed 256 buckets, keeping round 3's per-thread lists and quote-counting scanner. B) Try 512/1024
@@ -22,7 +35,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Cons / risks:**
   - Dedup tables at 20M (~78k events) exceed a Xeon's L2 again
   - `SHOPPING_BUCKET_BITS` still lets tests force other counts
-- **Result:** — (attempt #8 pending)
+- **Result:** Attempt #8: 3.2035 → 3.0086 s
 
 ## Person identity: 128-bit name hash instead of byte comparison
 - **Context:** Telling people apart compared their names byte by byte. For one-ID people the bytes sit in each event's own line, scattered across the input, so most comparisons and linked-ID lookups read memory that isn't in cache; on a Xeon with ~1 MB L2 per core that likely costs a trip to main memory per event
