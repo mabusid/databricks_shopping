@@ -26,6 +26,6 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
 3. [x] Clean the logs (checked by `tests/check_steps.py`)
 4. [x] Join each person's IDs (checked by `tests/check_steps.py`)
 5. [x] Build sessions (`user_daily` matches all 36 fixtures and the dev answer)
-6. [ ] Credit sessions to ad clicks, count assisting campaigns
+6. [x] Credit sessions to ad clicks, count assisting campaigns (both tables match the dev answer)
 7. [ ] All 36 fixtures pass → first submission
 8. [ ] Profile and optimize, one change per submission

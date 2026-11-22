@@ -2,8 +2,10 @@
 Polars pipeline. It shares no code with pipeline/pipeline.py on purpose: different
 tools (str.split, datetime, Python ints) so the two do not share the same mistakes.
 
-So far it covers step 3, cleaning: events rules 1-4, clicks rules 1-3, links rule 1.
+It covers steps 3-6: cleaning, linked IDs, sessions and user_daily, and click
+credit, assists and campaign_daily.
 """
+import bisect
 import glob
 import json
 import os
@@ -213,3 +215,35 @@ def user_daily(data_dir):
         top = min(d["spend"].items(), key=lambda kv: (-kv[1], kv[0]))[0] if d["spend"] else None
         out.add((person, day, d["sessions"], d["events"], d["revenue"], top))
     return out
+
+
+def campaign_daily(data_dir):
+    """Clicks rules 4-7, brute force per session. Set of (campaign_id, channel, day,
+    sessions, purchasing_sessions, revenue_cents, assisted_sessions)."""
+    names = people(data_dir)
+    path = os.path.join(data_dir, "campaigns.csv")
+    channel = dict(v for v in (fields_of(line, 2) for line in lines_of(path)) if v is not None)
+    clicks_of = {}  # person -> sorted [(ts, click_id, campaign)]
+    for click_id, user, campaign, t in clean_clicks(data_dir):
+        clicks_of.setdefault(names.get(user, user), []).append((t, click_id, campaign))
+    times_of = {}
+    for person, clicks in clicks_of.items():
+        clicks.sort()
+        times_of[person] = [c[0] for c in clicks]
+    table = {}
+    for s in sessions(data_dir):
+        clicks, times = clicks_of.get(s["person"], []), times_of.get(s["person"], [])
+        # The person's clicks with start - 7 days <= ts <= start.
+        window = clicks[bisect.bisect_left(times, s["start"] - 7 * DAY_MS):bisect.bisect_right(times, s["start"])]
+        if window:
+            latest = max(c[0] for c in window)
+            credited = min((c[1], c[2]) for c in window if c[0] == latest)[1]  # tie: smallest click_id
+        else:
+            credited = "organic"
+        row = table.setdefault((credited, s["day"]), [0, 0, 0, 0])
+        row[0] += 1
+        row[1] += any(e[3] == "purchase" for e in s["events"])
+        row[2] += sum(e[5] for e in s["events"])
+        for campaign in {c[2] for c in window}:  # each campaign assists once
+            table.setdefault((campaign, s["day"]), [0, 0, 0, 0])[3] += 1
+    return {(c, channel.get(c, "organic"), d, *row) for (c, d), row in table.items()}

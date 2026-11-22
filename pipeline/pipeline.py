@@ -6,9 +6,8 @@ Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
 
-Status: steps 3-5 (clean the logs, join each person's IDs, build sessions)
-are done, so user_daily is complete. Step 6 (clicks) is still to do, so
-campaign_daily is still written empty.
+Steps (README plan): 3 clean the logs, 4 join each person's IDs, 5 build
+sessions and user_daily, 6 credit clicks, count assists, campaign_daily.
 """
 import glob
 import json
@@ -343,6 +342,103 @@ def user_daily(sessionized, sessions, products):
     )
 
 
+# --- Clicks: credit and assists (README step 6) --------------------------------
+def credit(sessions, clicks):
+    """Clicks rules 4-5: add each session's credited campaign_id.
+
+    The person's latest click with click.ts <= start and start - click.ts <= 7 days;
+    on a tie in ts, the smallest click_id. No such click: `organic`.
+    """
+    # One click per (person, ts): the smallest click_id, so the tie is settled before the join.
+    latest = (
+        clicks.group_by("person", "ts")
+        .agg(pl.col("campaign_id").sort_by("click_id").first())
+        .rename({"ts": "click_ts"})
+        .sort("click_ts")
+    )
+    return (
+        sessions.sort("start")
+        # Both sides are sorted on the join key just above; Polars can't verify that with `by`.
+        .join_asof(latest, left_on="start", right_on="click_ts", by="person", strategy="backward",
+                   check_sortedness=False)
+        .with_columns(
+            pl.when(pl.col("start") - pl.col("click_ts") <= WEEK_MS)
+            .then(pl.col("campaign_id")).otherwise(pl.lit("organic")).alias("campaign_id"))
+        .drop("click_ts")
+    )
+
+
+def assists(sessions, clicks):
+    """Clicks rule 7: assisted_sessions per (campaign_id, day).
+
+    A session is assisted by a campaign if the person clicked it at some ts with
+    start - 7 days <= ts <= start, that is, if its start lies in [ts, ts + 7 days].
+    Listing every (session, campaign) pair would be huge for heavy users, so we
+    count instead:
+      1. Per (person, campaign), merge the clicks' [ts, ts + 7 days] spans into
+         disjoint runs (a new run starts where the gap between clicks is over 7 days),
+         so each session is counted at most once per campaign.
+      2. Cut each run at day boundaries, keeping only days the person has sessions on.
+      3. Count the person's sessions in each piece from a running count of their
+         sessions in start order, looked up with join_asof.
+    """
+    person, campaign, ts = pl.col("person"), pl.col("campaign_id"), pl.col("ts")
+    new_run = ((person != person.shift(1)) | (campaign != campaign.shift(1))
+               | (ts - ts.shift(1) > WEEK_MS)).fill_null(True)
+    runs = (
+        clicks.select("person", "campaign_id", "ts").sort("person", "campaign_id", "ts")
+        .with_columns(new_run.cum_sum().alias("run"))
+        .group_by("run").agg(
+            person.first(), campaign.first(),
+            ts.min().alias("run_from"), (ts.max() + WEEK_MS).alias("run_to"))
+    )
+    day_from = pl.col("day").cast(pl.Int64) * DAY_MS  # first ms of the day
+    person_days = sessions.select("person", "day").unique().with_columns(day_from.alias("day_from"))
+    pieces = (
+        runs.join(person_days, on="person")
+        .filter((pl.col("day_from") <= pl.col("run_to")) & (pl.col("day_from") + DAY_MS > pl.col("run_from")))
+        .with_columns(
+            pl.max_horizontal("run_from", "day_from").alias("piece_from"),
+            pl.min_horizontal("run_to", pl.col("day_from") + DAY_MS - 1).alias("piece_to"))
+    )
+    # How many of the person's sessions start at or before t, for any t.
+    running = (sessions.select("person", "start")
+               .with_columns(pl.col("start").rank("ordinal").over("person").cast(pl.Int64).alias("count"))
+               .sort("start"))
+
+    def sessions_up_to(frame, t, name):
+        # Both sides are sorted on the join key; Polars can't verify that with `by`.
+        frame = frame.sort(t).join_asof(running, left_on=t, right_on="start", by="person",
+                                        strategy="backward", check_sortedness=False)
+        return frame.with_columns(pl.col("count").fill_null(0).alias(name)).drop("start", "count")
+
+    pieces = sessions_up_to(pieces.with_columns((pl.col("piece_from") - 1).alias("before")),
+                            "before", "n_before")
+    pieces = sessions_up_to(pieces, "piece_to", "n_to")
+    return (
+        pieces.with_columns((pl.col("n_to") - pl.col("n_before")).alias("n"))
+        .filter(pl.col("n") > 0)
+        .group_by("campaign_id", "day").agg(pl.col("n").sum().cast(pl.Int64).alias("assisted_sessions"))
+    )
+
+
+def campaign_daily(credited, assisted, campaigns):
+    """The campaign_daily table: one row per (campaign_id, day) credited or assisted."""
+    by_credit = credited.group_by("campaign_id", "day").agg(
+        pl.len().cast(pl.Int64).alias("sessions"),
+        (pl.col("purchases") > 0).sum().cast(pl.Int64).alias("purchasing_sessions"),
+        pl.col("revenue_cents").sum(),
+    )
+    counts = ["sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"]
+    return (
+        by_credit.join(assisted, on=["campaign_id", "day"], how="full", coalesce=True)
+        .with_columns(pl.col(c).fill_null(0) for c in counts)  # assisted only: 0 credited; organic: 0 assisted
+        .join(campaigns, on="campaign_id", how="left")
+        .with_columns(pl.col("channel").fill_null("organic"))  # only organic is not in campaigns.csv
+        .select("campaign_id", "channel", "day", *counts)
+    )
+
+
 # --- Output --------------------------------------------------------------------
 USER_DAILY = {
     "user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
@@ -366,15 +462,15 @@ def main():
     campaigns = read_table(os.path.join(DATA, "campaigns.csv"), CAMPAIGN_COLS)
     names = person_names(clean_links(DATA))
     events = with_person(clean_events(DATA, start, end), names)
-    clicks = with_person(clean_clicks(DATA, start, end, campaigns), names)  # noqa: F841 (step 6)
+    clicks = with_person(clean_clicks(DATA, start, end, campaigns), names).collect()
 
     sessionized = sessionize(events).collect()
     sessions = session_table(sessionized.lazy()).collect()
     write_table(user_daily(sessionized.lazy(), sessions.lazy(), products).collect(), "user_daily", USER_DAILY)
 
-    # TODO step 6: credit clicks and assists. Until then campaign_daily is written empty.
-    write_table(pl.DataFrame(schema=CAMPAIGN_DAILY), "campaign_daily", CAMPAIGN_DAILY)
-    print("wrote user_daily and an empty campaign_daily (step 6 to do)")
+    credited = credit(sessions, clicks)
+    write_table(campaign_daily(credited, assists(sessions, clicks), campaigns), "campaign_daily", CAMPAIGN_DAILY)
+    print("wrote user_daily and campaign_daily")
 
 
 def write_table(frame, name, schema):

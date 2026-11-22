@@ -13,6 +13,28 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Assists: count per day, don't list pairs
+- **Context:** The dev set has 181,032 sessions but 1,958,238 (session, campaign) assist pairs. At 60× the data that is likely over 100M pairs, more for whales, so listing pairs is too costly
+- **Options:** A) Per (person, campaign), merge the clicks' 7-day spans into disjoint runs. Cut each run by day, keeping only days with sessions, then count sessions per piece from a running count (`join_asof`). B) Join each session with the person's clicks in its 7 days and list distinct campaigns
+- **Chose:** A
+- **Pros:**
+  - Work grows with clicks × session-days, not sessions × clicks
+  - Merging runs counts each session once per campaign with no dedup step
+- **Cons / risks:**
+  - Harder to read than B, so `tests/oracle.py` does B by brute force as the check
+- **Result:** — (no submission yet). Matches the oracle on 37/37, all 36 fixtures pass, and the dev answer matches exactly
+
+## Credit: backward join_asof
+- **Context:** Each session goes to the person's latest click at or before its start within 7 days, with ties going to the smallest `click_id`
+- **Options:** A) First keep one click per (person, ts), the smallest `click_id`. Then a backward `join_asof` by person, nulling matches over 7 days old. B) Join sessions to all clicks in range and pick the best
+- **Chose:** A. The tie is settled before the join, so the join is never ambiguous
+- **Pros:**
+  - One sort-merge pass
+  - Exact 7-day check in our code, not Polars' `tolerance`
+- **Cons / risks:**
+  - Polars can't check sortedness with `by`. We sort on the key ourselves and pass `check_sortedness=False`
+- **Result:** — (no submission yet). Fixtures A1–A12 and L4 pass
+
 ## Sessions: one sort, gap flags, running sum
 - **Context:** Step 5 splits each person's events into sessions at gaps over 30 minutes; events with equal timestamps must share a session
 - **Options:** A) Sort all events by (person, ts), flag a new session where the person changes or the gap to the previous row is over 30 min, then take a running sum of the flags as the session id. B) Window functions per person (`over("person")`)

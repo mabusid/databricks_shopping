@@ -4,6 +4,7 @@ oracle's result, row for row.
 
 Step 3: cleaned events, clicks, links. Step 4: each linked ID's person, and the
 person of every event and click. Step 5: the sessions and the user_daily table.
+Step 6: the campaign_daily table.
 
 Usage: python tests/check_steps.py DATA_DIR...   (e.g. fixtures/*/input data)
 """
@@ -29,7 +30,10 @@ def pipeline_sets(data_dir):
     products = pp.read_table(os.path.join(data_dir, "products.csv"), pp.PRODUCT_COLS)
     sessionized = pp.sessionize(pp.with_person(events, names)).collect()
     sessions = pp.session_table(sessionized.lazy()).collect()
+    clicks_p = pp.with_person(clicks, names).collect()
+    campaigns_daily = pp.campaign_daily(pp.credit(sessions, clicks_p), pp.assists(sessions, clicks_p), campaigns)
     return {
+        "campaign_daily": set(campaigns_daily.rows()),
         "sessions": set(sessions.select("person", "start", "day", "events", "revenue_cents", "purchases").rows()),
         "user_daily": set(pp.user_daily(sessionized.lazy(), sessions.lazy(), products).collect().rows()),
         "events": set(events.collect().rows()),
@@ -45,6 +49,7 @@ def oracle_sets(data_dir):
     events, clicks = oracle.clean_events(data_dir), oracle.clean_clicks(data_dir)
     people = oracle.people(data_dir)
     return {
+        "campaign_daily": oracle.campaign_daily(data_dir),
         "sessions": {(s["person"], s["start"], s["day"], len(s["events"]), sum(e[5] for e in s["events"]),
                       sum(e[3] == "purchase" for e in s["events"])) for s in oracle.sessions(data_dir)},
         "user_daily": oracle.user_daily(data_dir),
