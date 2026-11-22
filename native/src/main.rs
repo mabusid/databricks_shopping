@@ -647,10 +647,6 @@ fn window(data: &Path) -> (i64, i64) {
 
 /// Per-thread results of the person pass.
 struct Tally {
-    /// user_daily rows with a top_category, and without (kept apart so each
-    /// Parquet part's null markers are one run, cheap to encode).
-    users: Vec<UserRow>,
-    users_no_top: Vec<UserRow>,
     /// [(campaign or organic) * days + day] -> (sessions, purchasing sessions, revenue)
     credited: Vec<[i64; 3]>,
     /// [campaign * days + day] -> assisted sessions
@@ -660,16 +656,11 @@ struct Tally {
 impl Tally {
     fn new(campaigns: usize, days: usize) -> Tally {
         Tally {
-            users: Vec::new(),
-            users_no_top: Vec::new(),
             credited: vec![[0; 3]; (campaigns + 1) * days],
             assisted: vec![0; campaigns * days],
         }
     }
-    fn push_user(&mut self, row: UserRow) {
-        if row.top.is_some() { self.users.push(row) } else { self.users_no_top.push(row) }
-    }
-    /// Add another thread's campaign counts to these (its user rows stay where they are).
+    /// Add another thread's campaign counts to these.
     fn add_counts(&mut self, other: &Tally) {
         for (a, b) in self.credited.iter_mut().zip(&other.credited) {
             for k in 0..3 {
@@ -679,6 +670,20 @@ impl Tally {
         for (a, b) in self.assisted.iter_mut().zip(&other.assisted) {
             *a += b;
         }
+    }
+}
+
+/// A group of buckets' user_daily rows, with a top_category and without (kept
+/// apart so each Parquet part's null markers are one run, cheap to encode).
+#[derive(Default)]
+struct Users {
+    top: Vec<UserRow>,
+    no_top: Vec<UserRow>,
+}
+
+impl Users {
+    fn push(&mut self, row: UserRow) {
+        if row.top.is_some() { self.top.push(row) } else { self.no_top.push(row) }
     }
 }
 
@@ -705,7 +710,7 @@ struct Context {
 /// People are numbered by their 128-bit key (no name is read), then events and clicks are
 /// placed person by person with a counting sort (two linear passes), so the
 /// only sorting left is by time within each person.
-fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &Context, tally: &mut Tally) {
+fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &Context, tally: &mut Tally, users: &mut Users) {
     let n_copies: usize = events.iter().map(|l| l.len()).sum();
     let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_copies / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
@@ -782,7 +787,7 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
             if sessions.is_empty() || ts - prev > SESSION_GAP {
                 let day = (ts.div_euclid(DAY) - cx.base_day) as usize; // rule 6: the start's UTC date
                 if row.as_ref().is_some_and(|r| r.day as i64 != cx.base_day + day as i64) {
-                    tally.push_user(finish_row(row.take().unwrap(), &mut spend, cx));
+                    users.push(finish_row(row.take().unwrap(), &mut spend, cx));
                 }
                 let r = row.get_or_insert(UserRow {
                     person: names[p],
@@ -806,7 +811,7 @@ fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &
                 s.revenue += price;
             }
         }
-        tally.push_user(finish_row(row.take().unwrap(), &mut spend, cx));
+        users.push(finish_row(row.take().unwrap(), &mut spend, cx));
 
         let clicks = &mut cks[ck_at[p] as usize..ck_at[p + 1] as usize];
         if clicks.is_empty() {
@@ -1075,24 +1080,81 @@ fn run() {
     });
     log("events deduped");
 
-    // Pass 3: per person bucket.
+    // Pass 3: per person bucket, in groups of buckets. Each group writes its own
+    // user_daily parts as soon as it is done, so writing overlaps the other
+    // groups' work instead of running after all of them.
     let cx = Context { base_day, days, campaigns, categories: category_names.len(), category_order };
+    let checksum = std::env::var("SHOPPING_CHECKSUM").is_ok();
+    // SHOPPING_CHECKSUM=1: an order-independent checksum of both tables, so a
+    // probe can check on the scorer that two builds wrote the same rows.
+    let row_hash = |fields: &[&[u8]]| {
+        let mut buf = Vec::new();
+        for f in fields {
+            buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            buf.extend_from_slice(f);
+        }
+        xxhash_rust::xxh3::xxh3_64(&buf)
+    };
+    let user_hash = |u: &UserRow| {
+        let top = u.top.map_or(&b"\xffnull"[..], |c| category_names[c as usize]);
+        row_hash(&[u.person, &u.day.to_le_bytes(), &u.sessions.to_le_bytes(), &u.events.to_le_bytes(), &u.revenue.to_le_bytes(), top])
+    };
+    let write_users = |part: usize, users: &[UserRow]| {
+        output::write_table(&out, "user_daily", part, output::USER_DAILY, vec![
+            Column::Str(users.iter().map(|u| u.person).collect()),
+            Column::Date(users.iter().map(|u| u.day).collect()),
+            Column::I64(users.iter().map(|u| u.sessions).collect()),
+            Column::I64(users.iter().map(|u| u.events).collect()),
+            Column::I64(users.iter().map(|u| u.revenue).collect()),
+            Column::OptStr(users.iter().map(|u| u.top.map(|c| category_names[c as usize])).collect()),
+        ])
+    };
+    let user_rows = std::sync::atomic::AtomicUsize::new(0);
+    let user_sum = std::sync::atomic::AtomicU64::new(0);
+    let mut pairs = by_bucket(events).into_iter().zip(by_bucket(clicks));
+    let per_group = (buckets() / knob("SHOPPING_WRITE_GROUPS", 64).max(1)).max(1);
+    let mut groups = Vec::new();
+    loop {
+        let g: Vec<_> = pairs.by_ref().take(per_group).collect();
+        if g.is_empty() {
+            break;
+        }
+        groups.push(g);
+    }
     // One tally per worker thread (rayon's fold made one per work split, and
     // merging dozens of them cost ~3%); only the campaign counts are merged.
     let tallies: Vec<Tally> = per_thread(threads, || Tally::new(campaigns, days), |acc| {
-        by_bucket(events).into_par_iter().zip(by_bucket(clicks)).for_each(|(evs, cks)| {
-            person_bucket(&evs, &cks, &cx, &mut acc());
-            evs.into_iter().for_each(BlockList::release);
-            cks.into_iter().for_each(BlockList::release);
+        groups.into_par_iter().enumerate().for_each(|(gi, group)| {
+            let mut users = Users::default();
+            for (evs, cks) in group {
+                person_bucket(&evs, &cks, &cx, &mut acc(), &mut users);
+                evs.into_iter().for_each(BlockList::release);
+                cks.into_iter().for_each(BlockList::release);
+            }
+            for (k, rows) in [&users.top, &users.no_top].into_iter().enumerate() {
+                if !rows.is_empty() {
+                    write_users(2 * gi + k, rows);
+                    user_rows.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
+                    if checksum {
+                        let h = rows.iter().fold(0u64, |a, u| a.wrapping_add(user_hash(u)));
+                        user_sum.fetch_add(h, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            std::mem::forget(users); // freeing costs time and the process ends soon
         });
     });
+    let user_rows = user_rows.into_inner();
+    if user_rows == 0 {
+        write_users(0, &[]); // still write one (empty) file with the schema
+    }
     let mut tally = Tally::new(campaigns, days);
     for t in &tallies {
         tally.add_counts(t);
     }
-    log("sessions, credit and assists");
+    log("sessions, credit, assists and user_daily");
 
-    // Output.
+    // campaign_daily.
     let mut cols = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for c in 0..=campaigns {
         for d in 0..days {
@@ -1109,56 +1171,17 @@ fn run() {
             }
         }
     }
-    // user_daily is large: each thread's rows with and without a top_category
-    // are separate part files, written in parallel.
-    let mut parts: Vec<&[UserRow]> =
-        tallies.iter().flat_map(|t| [&t.users[..], &t.users_no_top[..]]).filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        parts.push(&[]); // still write one (empty) file with the schema
-    }
-    let user_rows: usize = parts.iter().map(|p| p.len()).sum();
-    // SHOPPING_CHECKSUM=1: an order-independent checksum of both tables, so a
-    // probe can check on the scorer that two builds wrote the same rows.
-    if std::env::var("SHOPPING_CHECKSUM").is_ok() {
-        let row = |fields: &[&[u8]]| {
-            let mut buf = Vec::new();
-            for f in fields {
-                buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
-                buf.extend_from_slice(f);
-            }
-            xxhash_rust::xxh3::xxh3_64(&buf)
-        };
-        let users = parts.iter().flat_map(|p| p.iter()).fold(0u64, |acc, u| {
-            let top = u.top.map_or(&b"\xffnull"[..], |c| category_names[c as usize]);
-            acc.wrapping_add(row(&[u.person, &u.day.to_le_bytes(), &u.sessions.to_le_bytes(),
-                                   &u.events.to_le_bytes(), &u.revenue.to_le_bytes(), top]))
-        });
+    if checksum {
         let campaign = (0..cols.0.len()).fold(0u64, |acc, i| {
-            acc.wrapping_add(row(&[cols.0[i], cols.1[i], &cols.2[i].to_le_bytes(), &cols.3[i].to_le_bytes(),
-                                   &cols.4[i].to_le_bytes(), &cols.5[i].to_le_bytes(), &cols.6[i].to_le_bytes()]))
+            acc.wrapping_add(row_hash(&[cols.0[i], cols.1[i], &cols.2[i].to_le_bytes(), &cols.3[i].to_le_bytes(),
+                                        &cols.4[i].to_le_bytes(), &cols.5[i].to_le_bytes(), &cols.6[i].to_le_bytes()]))
         });
-        eprintln!("checksum user_daily {user_rows} rows {users:016x}  campaign_daily {} rows {campaign:016x}", cols.0.len());
+        eprintln!("checksum user_daily {user_rows} rows {:016x}  campaign_daily {} rows {campaign:016x}", user_sum.into_inner(), cols.0.len());
     }
-    rayon::join(
-        || {
-            parts.par_iter().enumerate().for_each(|(part, users)| {
-                output::write_table(&out, "user_daily", part, output::USER_DAILY, vec![
-                    Column::Str(users.iter().map(|u| u.person).collect()),
-                    Column::Date(users.iter().map(|u| u.day).collect()),
-                    Column::I64(users.iter().map(|u| u.sessions).collect()),
-                    Column::I64(users.iter().map(|u| u.events).collect()),
-                    Column::I64(users.iter().map(|u| u.revenue).collect()),
-                    Column::OptStr(users.iter().map(|u| u.top.map(|c| category_names[c as usize])).collect()),
-                ])
-            });
-        },
-        || {
-            output::write_table(&out, "campaign_daily", 0, output::CAMPAIGN_DAILY, vec![
-                Column::Str(cols.0), Column::Str(cols.1), Column::Date(cols.2), Column::I64(cols.3),
-                Column::I64(cols.4), Column::I64(cols.5), Column::I64(cols.6),
-            ])
-        },
-    );
+    output::write_table(&out, "campaign_daily", 0, output::CAMPAIGN_DAILY, vec![
+        Column::Str(cols.0), Column::Str(cols.1), Column::Date(cols.2), Column::I64(cols.3),
+        Column::I64(cols.4), Column::I64(cols.5), Column::I64(cols.6),
+    ]);
     // SHOPPING_FAKE_ROW=1 adds one made-up campaign_daily row, only so a probe
     // submission fails the dev check on purpose and the scorer shows its logs.
     if std::env::var("SHOPPING_FAKE_ROW").is_ok() {
