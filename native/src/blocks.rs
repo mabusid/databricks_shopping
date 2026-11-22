@@ -14,22 +14,25 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// Bytes per block. Every element type stored here is `Copy`, at most 64-byte aligned.
-pub const BLOCK_BYTES: usize = 64 << 10;
-/// Address space reserved for all blocks (only touched pages use memory).
-const ARENA_BYTES: usize = 32 << 30;
+/// Small, because every list's last block is partly empty and there are
+/// thousands of lists (buckets x threads x kinds).
+pub const BLOCK_BYTES: usize = 16 << 10;
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+static ARENA_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// Reserve the arena (once, before any block is taken).
-pub fn init() {
+/// Reserve the arena (once, before any block is taken): `bytes` of address
+/// space (only touched pages use memory), at most 32 GB so 32-bit references work.
+pub fn init(bytes: usize) {
     if BASE.load(Relaxed) != 0 {
         return;
     }
     const ALIGN: usize = 2 << 20;
+    let bytes = bytes.next_multiple_of(ALIGN).clamp(64 << 20, 32 << 30);
     // SAFETY: a fresh private anonymous reservation, never unmapped.
     let p = unsafe {
-        libc::mmap(std::ptr::null_mut(), ARENA_BYTES + ALIGN, libc::PROT_READ | libc::PROT_WRITE,
+        libc::mmap(std::ptr::null_mut(), bytes + ALIGN, libc::PROT_READ | libc::PROT_WRITE,
                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0)
     };
     assert!(p != libc::MAP_FAILED, "reserve arena");
@@ -38,15 +41,16 @@ pub fn init() {
     #[cfg(target_os = "linux")]
     // SAFETY: the range lies inside the reservation; advice never changes its contents.
     unsafe {
-        libc::madvise(base as *mut libc::c_void, ARENA_BYTES, libc::MADV_HUGEPAGE);
+        libc::madvise(base as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
     }
+    ARENA_BYTES.store(bytes, Relaxed);
     BASE.store(base, Relaxed);
 }
 
 #[inline]
 fn take_block() -> *mut u8 {
     let off = NEXT.fetch_add(BLOCK_BYTES, Relaxed);
-    assert!(off + BLOCK_BYTES <= ARENA_BYTES, "arena full");
+    assert!(off + BLOCK_BYTES <= ARENA_BYTES.load(Relaxed), "arena full");
     (BASE.load(Relaxed) + off) as *mut u8
 }
 
@@ -167,7 +171,7 @@ mod tests {
 
     #[test]
     fn push_iterate_refs() {
-        init();
+        init(1 << 30);
         let mut s: Scatter<u64> = Scatter::new(3);
         let n = BLOCK_BYTES / 8 * 3 + 7;
         let mut last = std::ptr::null_mut();

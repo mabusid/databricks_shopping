@@ -956,7 +956,6 @@ fn run() {
     let (start, end) = window(&data);
     // Times are stored as u32 ms after window_start (clicks: after window_start - 7 days).
     assert!(end > start && end - start + WEEK < 1 << 32, "window too long for 32-bit offsets");
-    blocks::init();
     let base_day = start.div_euclid(DAY);
     let days = ((end - 1).div_euclid(DAY) - base_day + 1) as usize;
 
@@ -1015,6 +1014,10 @@ fn run() {
     // change neither credit (same ts and click_id) nor assists (each campaign
     // counts once): it is skipped.
     let click_chunks = input::dir_chunks(&data.join("clicks"), chunk_bytes);
+    // Block memory: an event line (46+ bytes) leaves at most 48 bytes of records, a
+    // click line (21+ bytes) 24, plus every list's partly filled last block.
+    let click_bytes: usize = click_chunks.iter().map(|c| c.len()).sum();
+    blocks::init(event_bytes * 11 / 10 + click_bytes * 12 / 10 + 3 * buckets() * threads * blocks::BLOCK_BYTES + (256 << 20));
     let work: Vec<(bool, &'static [u8])> =
         event_chunks.iter().map(|&c| (false, c)).chain(click_chunks.iter().map(|&c| (true, c))).collect();
     let lists: Vec<ParseLists> = per_thread(threads, ParseLists::new, |acc| {
