@@ -49,42 +49,6 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
    - Attempts #3–#9: Rust speed-ups, 5.9099 → 2.8037 s (see SCORES.md and DECISIONS.md)
    - Next: the plan below
 
-## Status and handoff (2026-11-22 ~03:50 EST)
-
-**Best scored:** 2.1554 s (`cb75e70`, compact records). The leaderboard top is < 0.5 s; the target is < 0.4 s.
-
-**Not yet scored** (newest last; each is verified: 36/36 fixtures, dev answer, emulated amd64 image, Rust = Polars on 10 seeds):
-- `0f85cb1` #16: flat link table, slots prefetched 8 lines ahead (Linux proxy ~3–5% faster than #15)
-- `7642935` #17: experiment, 1024 buckets for inputs over 1 GB. Scorer-only effect; revert if the score worsens
-
-**Fallbacks.** Every pushed commit is correct. Polars `82a5c68` (28.4511 s) is the slowest safe one.
-
-**How to measure without a submission**
-- `tests/bench_linux.sh DATA [RUNS] [SRC]`, run on a 2M-event set: the Linux (Docker) time × 10 ≈ the scorer's time (calibrated: 0.211 s → 2.48 s, 0.20 s → 2.23 s)
-- Make the 2M set with `generator/target/release/generate --seed 1 --events 2000000 --clicks 500000 --output DIR`
-- This Mac has 8 GB of RAM and the VM is starved, so sequential runs drift. **Always compare builds interleaved in one container** (build both, alternate runs, compare best / p25 / median)
-- Profile on Linux with `perf record` in a `--privileged` debian container, then map `perf report --sort sym` addresses with `addr2line -f -i` against a `--profile profiling` build
-- Correctness: `tests/compare_engines.sh` (fixtures + dev answer + Rust vs Polars on seeds; `BIN=` tests another build), `cargo test`, then the amd64 image via `docker buildx --platform linux/amd64` with `scripts/docker_run.sh`
-
-**Where the time goes now** (#16, 2M events, Linux, 4 threads, ~0.20 s total)
-| Stage | Time | Inside it |
-|---|---|---|
-| Parse events | ~0.115 s | scan 0.027, timestamps 0.017, person lookup ~0.025, writing copies into fresh memory ~0.045 (0.03 if the memory were reused) |
-| Person pass | ~0.025 s | numbering hash table, counting sort, per-person sorts, sessions, credit, assists |
-| Dedup | ~0.023 s | per-bucket hash table on `event_id`, emit survivors |
-| Clicks | ~0.018 s | same scanner as events |
-| Linked IDs + small tables | ~0.011 s | parallel union-find |
-| Write | ~0.011 s | Parquet crate, 16 parts in parallel |
-
-**Tried and dropped (measured):** Polars tuning; 2048 buckets with growing Vecs (#6, slower); mimalloc; glibc tunables; freeing copies for reuse; one huge mmap region per thread; memchr3 scanning; largest-bucket-first scheduling; a click prefetch pipeline; sorting `user_daily` by name address.
-
-**Ideas not yet tried, for bigger structural cuts**
-- **Fewer bytes per event through the shuffles.** Copies are 64 B and events 40 B. E.g. timestamps as u32 offsets, and dropping the per-copy `event_id` slice by making event IDs 128-bit keys too, would extend the user's 128-bit identity decision, so ask first
-- **One shuffle instead of two.** Bucket copies by person, dedup within each person bucket, and resolve the rare cross-person duplicates (copies naming different users, ~1/64 of duplicated events; invalid copies with empty users) through a small side channel
-- **Several lines parsed side by side per thread** (1BRC measured −22%); AVX2/AVX-512 scanning on the scorer (untestable here: the emulator lacks AVX2)
-- **Our own Parquet writer** (PLAIN pages, RLE definition levels)
-- **Overlap stages** (clicks with dedup), and parse `products.csv` in parallel
-
 ## Plan toward < 0.4 s (from 2.8037 s, attempt #9)
 
 ### The measuring stick
