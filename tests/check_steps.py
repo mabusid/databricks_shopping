@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Step 3 check: the pipeline's cleaned events, clicks and links must equal the
-plain-Python oracle's, row for row.
+"""Step-by-step check: each finished pipeline step must equal the plain-Python
+oracle's result, row for row.
 
-Usage: python tests/check_clean.py DATA_DIR...   (e.g. fixtures/*/input data)
+Step 3: cleaned events, clicks, links. Step 4: each linked ID's person, and the
+person of every event and click.
+
+Usage: python tests/check_steps.py DATA_DIR...   (e.g. fixtures/*/input data)
 """
 import json
 import os
@@ -20,18 +23,29 @@ def pipeline_sets(data_dir):
     with open(os.path.join(data_dir, "manifest.json")) as f:
         start, end = pp.window_ms(json.load(f))
     campaigns = pp.read_table(os.path.join(data_dir, "campaigns.csv"), pp.CAMPAIGN_COLS)
+    events = pp.clean_events(data_dir, start, end)
+    clicks = pp.clean_clicks(data_dir, start, end, campaigns)
+    names = pp.person_names(pp.clean_links(data_dir))
     return {
-        "events": set(pp.clean_events(data_dir, start, end).collect().rows()),
-        "clicks": set(pp.clean_clicks(data_dir, start, end, campaigns).collect().rows()),
+        "events": set(events.collect().rows()),
+        "clicks": set(clicks.collect().rows()),
         "links": set(pp.clean_links(data_dir).collect().rows()),
+        "people": set(names.rows()),
+        "event_person": set(pp.with_person(events, names).select("event_id", "person").collect().rows()),
+        "click_person": set(pp.with_person(clicks, names).select("click_id", "person").collect().rows()),
     }
 
 
 def oracle_sets(data_dir):
+    events, clicks = oracle.clean_events(data_dir), oracle.clean_clicks(data_dir)
+    people = oracle.people(data_dir)
     return {
-        "events": oracle.clean_events(data_dir),
-        "clicks": oracle.clean_clicks(data_dir),
+        "events": events,
+        "clicks": clicks,
         "links": oracle.clean_links(data_dir),
+        "people": set(people.items()),
+        "event_person": {(e[0], people.get(e[1], e[1])) for e in events},
+        "click_person": {(c[0], people.get(c[1], c[1])) for c in clicks},
     }
 
 

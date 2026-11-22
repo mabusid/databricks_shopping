@@ -13,9 +13,22 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Linked IDs: scipy connected components
+- **Context:** Step 4 must merge each person's IDs, through chains hundreds of links long and shared devices joining thousands of people
+- **Options:** A) Number the IDs in byte order, then use scipy's `connected_components`. B) Repeated min-label passes in Polars. C) Union-find in plain Python
+- **Chose:** A
+- **Pros:**
+  - One pass in compiled code, however long the chains
+  - Numbering in byte order makes each person's name the first ID of its group, with no string comparisons
+- **Cons / risks:**
+  - Adds numpy and scipy to the image (about 0.15 s to import when warm)
+  - B would need a pass per link of chain length, unless sped up with pointer jumping
+  - C is a few seconds slower at full size (it is the oracle's method)
+- **Result:** — (no submission yet). `tests/check_steps.py` matches the oracle's union-find on 37/37, and the L2 and L3 names match `fixtures/README.md`
+
 ## Test cleaning against a plain-Python oracle
 - **Context:** The fixtures check only the final tables, so they can't test step 3 until steps 4–6 exist
-- **Options:** A) A second, literal plain-Python version of the rules (`tests/oracle.py`), compared row by row (`tests/check_clean.py`). B) Wait for the fixtures at step 7
+- **Options:** A) A second, literal plain-Python version of the rules (`tests/oracle.py`), compared row by row (`tests/check_steps.py`). B) Wait for the fixtures at step 7
 - **Chose:** A
 - **Pros:**
   - Finds cleaning bugs now, on all fixtures and the 1M-event dev set

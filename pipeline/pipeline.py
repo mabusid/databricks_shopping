@@ -6,8 +6,8 @@ Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
 
-Status: step 3 (clean the logs) is done. Steps 4-6 are still to do, so the
-output tables are still written empty.
+Status: steps 3 (clean the logs) and 4 (join each person's IDs) are done.
+Steps 5-6 are still to do, so the output tables are still written empty.
 """
 import glob
 import json
@@ -243,6 +243,42 @@ def read_table(path, names):
     return split_fields(read_lines([path]), names).collect()
 
 
+# --- Linked IDs (README step 4) ------------------------------------------------
+def person_names(links):
+    """Linked IDs rules 2-3: for every ID in a kept link, user_id -> person.
+
+    A person is a connected component of the link graph, however long its
+    chains, and is named by its byte-wise smallest ID. An ID in no link is a
+    person on its own; with_person handles that.
+    """
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    links = links.collect()
+    # Sorted, so the order of the ID numbers is the IDs' byte order (Polars sorts strings byte-wise).
+    ids = pl.concat([links["user_id_a"], links["user_id_b"]]).unique().sort()
+    if ids.len() == 0:
+        return pl.DataFrame(schema={"user_id": pl.String, "person": pl.String})
+    a = ids.search_sorted(links["user_id_a"]).to_numpy()
+    b = ids.search_sorted(links["user_id_b"]).to_numpy()
+    # int32 weights: repeated links are summed, and a narrower type could overflow to 0.
+    graph = coo_matrix((np.ones(len(a), dtype=np.int32), (a, b)), shape=(ids.len(), ids.len()))
+    _, component = connected_components(graph, directed=False)
+    # The first ID of each component in byte order is its smallest, so it is the name.
+    _, first = np.unique(component, return_index=True)
+    return pl.DataFrame({"user_id": ids, "person": ids.gather(first[component])})
+
+
+def with_person(frame, names):
+    """Replace user_id with person: the linked name, or the ID itself if it is in no link."""
+    return (
+        frame.join(names.lazy(), on="user_id", how="left")
+        .with_columns(pl.coalesce("person", "user_id").alias("person"))
+        .drop("user_id")
+    )
+
+
 # --- Output --------------------------------------------------------------------
 USER_DAILY = {
     "user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
@@ -264,17 +300,17 @@ def main():
 
     products = read_table(os.path.join(DATA, "products.csv"), PRODUCT_COLS)  # noqa: F841 (step 5)
     campaigns = read_table(os.path.join(DATA, "campaigns.csv"), CAMPAIGN_COLS)
-    events = clean_events(DATA, start, end)  # noqa: F841 (steps 4-6)
-    clicks = clean_clicks(DATA, start, end, campaigns)  # noqa: F841 (steps 4-6)
-    links = clean_links(DATA)  # noqa: F841 (step 4)
+    names = person_names(clean_links(DATA))
+    events = with_person(clean_events(DATA, start, end), names)  # noqa: F841 (steps 5-6)
+    clicks = with_person(clean_clicks(DATA, start, end, campaigns), names)  # noqa: F841 (step 6)
 
-    # TODO steps 4-6: join each person's IDs, build sessions, credit clicks and assists.
+    # TODO steps 5-6: build sessions, credit clicks and assists.
     # Until then both tables are written empty, with the exact schema.
     for name, schema in (("user_daily", USER_DAILY), ("campaign_daily", CAMPAIGN_DAILY)):
         folder = os.path.join(OUT, name)
         os.makedirs(folder, exist_ok=True)
         pl.DataFrame(schema=schema).write_parquet(os.path.join(folder, "part-0.parquet"))
-    print("wrote empty user_daily and campaign_daily (steps 4-6 to do)")
+    print("wrote empty user_daily and campaign_daily (steps 5-6 to do)")
 
 
 if __name__ == "__main__":

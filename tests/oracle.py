@@ -133,3 +133,25 @@ def clean_clicks(data_dir):
 def clean_links(data_dir):
     """Set of (user_id_a, user_id_b)."""
     return {(a, b) for a, b in rows(data_dir, "links", 2) if a is not None and b is not None}
+
+
+def people(data_dir):
+    """Linked IDs rules 2-3 by union-find: {user_id: person} for every ID in a kept link.
+    An ID in no link is its own person; callers use people.get(id, id)."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in clean_links(data_dir):
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_a] = root_b
+    members = {}
+    for x in list(parent):
+        members.setdefault(find(x), []).append(x)
+    return {x: min(group) for group in members.values() for x in group}  # str min is byte-wise for UTF-8
