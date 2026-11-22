@@ -11,6 +11,7 @@
 //!   4. per person bucket: sessions, user_daily rows, click credit, assists
 //! Every field is a slice of the memory-mapped input; nothing is copied.
 
+mod blocks;
 mod input;
 mod output;
 mod parse;
@@ -18,6 +19,7 @@ mod parse;
 use foldhash::fast::FixedState;
 use hashbrown::hash_map::Entry;
 use hashbrown::{HashMap, HashTable};
+use blocks::BlockList;
 use output::Column;
 use parse::{ts_ms, BAD};
 use rayon::prelude::*;
@@ -87,13 +89,26 @@ fn per_thread<A: Send>(threads: usize, new: impl Fn() -> A, work: impl for<'a> F
     accs.into_iter().map(|m| m.into_inner().unwrap()).collect()
 }
 
-fn new_buckets<T>(capacity: usize) -> Vec<Vec<T>> {
-    (0..buckets()).map(|_| Vec::with_capacity(capacity)).collect()
+/// One empty list per bucket.
+fn new_lists<T: Copy>() -> Vec<BlockList<T>> {
+    (0..buckets()).map(|_| BlockList::new()).collect()
+}
+
+/// Per-thread lists of every bucket -> per-bucket lists of every thread.
+fn by_bucket<T: Copy>(per_thread: Vec<Vec<BlockList<T>>>) -> Vec<Vec<BlockList<T>>> {
+    let mut out: Vec<Vec<BlockList<T>>> = (0..buckets()).map(|_| Vec::with_capacity(per_thread.len())).collect();
+    for lists in per_thread {
+        for (bi, list) in lists.into_iter().enumerate() {
+            out[bi].push(list);
+        }
+    }
+    out
 }
 
 /// One copy of an event, as parsed. `ok`: rules 3-4 hold for this copy. For a
 /// copy that is ok, its person and category are looked up while parsing,
 /// when the line is still in cache; for one that isn't they are left empty.
+#[derive(Clone, Copy)]
 struct EventCopy {
     h: u64, // hash of event_id
     event_id: Str,
@@ -124,6 +139,7 @@ struct Lookups<'a> {
 }
 
 /// A surviving event, with its person.
+#[derive(Clone, Copy)]
 struct Event {
     person: Str,
     key: PersonKey, // the person's 128-bit identity
@@ -134,6 +150,7 @@ struct Event {
 }
 
 /// A valid click, with its person.
+#[derive(Clone, Copy)]
 struct Click {
     key: PersonKey, // the person's 128-bit identity
     ts: i64,
@@ -473,13 +490,13 @@ struct Context {
 /// People are numbered by their 128-bit key (no name is read), then events and clicks are
 /// placed person by person with a counting sort (two linear passes), so the
 /// only sorting left is by time within each person.
-fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usize, cx: &Context, tally: &mut Tally) {
-    let n_events: usize = events.iter().map(|e| e[bi].len()).sum();
+fn person_bucket(events: &[BlockList<Event>], clicks: &[BlockList<Click>], cx: &Context, tally: &mut Tally) {
+    let n_events: usize = events.iter().map(|l| l.len()).sum();
     let mut number: HashTable<(PersonKey, u32)> = HashTable::with_capacity(n_events / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
     let mut counts: Vec<u32> = Vec::new();
     let mut ids: Vec<u32> = Vec::with_capacity(n_events);
-    for e in events.iter().flat_map(|e| &e[bi]) {
+    for e in events.iter().flat_map(|l| l.iter()) {
         let id = match number.entry(e.key.0, |&(k, _)| k == e.key, |x| x.0.0) {
             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
             hashbrown::hash_table::Entry::Vacant(v) => {
@@ -500,7 +517,7 @@ fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usi
     }
     let mut fill: Vec<u32> = ev_at[..people].to_vec();
     let mut evs: Vec<(i64, i32, u16, u8)> = vec![(0, 0, 0, 0); n_events];
-    for (e, &id) in events.iter().flat_map(|e| &e[bi]).zip(&ids) {
+    for (e, &id) in events.iter().flat_map(|l| l.iter()).zip(&ids) {
         let at = &mut fill[id as usize];
         evs[*at as usize] = (e.ts, e.price, e.category, e.event_type);
         *at += 1;
@@ -508,7 +525,7 @@ fn person_bucket(events: &[Vec<Vec<Event>>], clicks: &[Vec<Vec<Click>>], bi: usi
     drop(ids);
     // Clicks of people with events, the same way: (ts, click_id, campaign).
     let mut click_ids: Vec<(u32, u32)> = Vec::new(); // (person, index into the flat click list)
-    let flat_clicks: Vec<&Click> = clicks.iter().flat_map(|c| &c[bi]).collect();
+    let flat_clicks: Vec<&Click> = clicks.iter().flat_map(|l| l.iter()).collect();
     let mut ck_count = vec![0u32; people];
     for (k, c) in flat_clicks.iter().enumerate() {
         if let Some(&(_, id)) = number.find(c.key.0, |&(k, _)| k == c.key) {
@@ -717,16 +734,15 @@ fn run() {
     // Pass 1: parse every event copy, bucketed by event_id.
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
-    let event_bytes: usize = event_chunks.iter().map(|c| c.len()).sum();
     // 256 buckets. Scaling them with the input (2048 at 20M, to keep each dedup
     // table in L2) made attempt #6 slower: the wider scatter while parsing cost
     // more. SHOPPING_BUCKET_BITS overrides it, only for testing other counts.
     let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(8);
     BUCKET_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
-    let (nb, threads) = (buckets(), rayon::current_num_threads());
+    let threads = rayon::current_num_threads();
     // Bucket lists are kept per worker thread, not per chunk, so their number
     // depends on the threads, not on the input size.
-    let copies: Vec<Vec<Vec<EventCopy>>> = per_thread(threads, || new_buckets(event_bytes / 80 / nb / threads + 16), |acc| {
+    let copies: Vec<Vec<BlockList<EventCopy>>> = per_thread(threads, new_lists::<EventCopy>, |acc| {
         event_chunks.par_iter().for_each(|&chunk| {
             let mut b = acc();
             input::for_each_record::<7>(chunk, |rec| {
@@ -740,13 +756,16 @@ fn run() {
 
     // Pass 2: dedup before validation (each event_id's earliest copy, valid or
     // not), drop invalid events, re-bucket the survivors by person.
-    let events: Vec<Vec<Vec<Event>>> = per_thread(threads, || new_buckets(event_bytes / 90 / nb / threads + 16), |acc| {
-        (0..nb).into_par_iter().for_each(|bi| {
+    // Each bucket's copy blocks go back to the pool as soon as it is done, so the
+    // event (and later click) lists reuse memory that is already mapped.
+    let copies = by_bucket(copies);
+    let events: Vec<Vec<BlockList<Event>>> = per_thread(threads, new_lists::<Event>, |acc| {
+        copies.into_par_iter().for_each(|lists| {
             let mut b = acc();
-            let n: usize = copies.iter().map(|c| c[bi].len()).sum();
+            let n: usize = lists.iter().map(|l| l.len()).sum();
             let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
             let mut kept: Vec<&EventCopy> = Vec::with_capacity(n);
-            for c in copies.iter().flat_map(|c| &c[bi]) {
+            for c in lists.iter().flat_map(|l| l.iter()) {
                 match first.entry(c.h, |&(h, k)| h == c.h && same(kept[k as usize].event_id, c.event_id), |e| e.0) {
                     hashbrown::hash_table::Entry::Occupied(e) => {
                         let k = e.get().1 as usize;
@@ -765,18 +784,18 @@ fn run() {
                     person: c.person, key: c.key, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
                 });
             }
+            for l in lists {
+                l.release();
+            }
         });
     });
-    // Big tables are never freed: freeing costs time (madvise/munmap) and the process ends soon.
-    std::mem::forget(copies);
     log("events deduped and validated");
 
     // Pass 3: clicks. Copies of a click are identical, so dedup can change
     // neither credit (same ts and click_id) nor assists (each campaign counts
     // once): it is skipped.
     let click_chunks = input::dir_chunks(&data.join("clicks"), CHUNK_BYTES);
-    let click_bytes: usize = click_chunks.iter().map(|c| c.len()).sum();
-    let clicks: Vec<Vec<Vec<Click>>> = per_thread(threads, || new_buckets(click_bytes / 45 / nb / threads + 16), |acc| {
+    let clicks: Vec<Vec<BlockList<Click>>> = per_thread(threads, new_lists::<Click>, |acc| {
         click_chunks.par_iter().for_each(|&chunk| {
             let mut b = acc();
             input::for_each_record::<4>(chunk, |rec| {
@@ -801,7 +820,11 @@ fn run() {
     // One tally per worker thread (rayon's fold made one per work split, and
     // merging dozens of them cost ~3%); only the campaign counts are merged.
     let tallies: Vec<Tally> = per_thread(threads, || Tally::new(campaigns, days), |acc| {
-        (0..nb).into_par_iter().for_each(|bi| person_bucket(&events, &clicks, bi, &cx, &mut acc()));
+        by_bucket(events).into_par_iter().zip(by_bucket(clicks)).for_each(|(evs, cks)| {
+            person_bucket(&evs, &cks, &cx, &mut acc());
+            evs.into_iter().for_each(BlockList::release);
+            cks.into_iter().for_each(BlockList::release);
+        });
     });
     let mut tally = Tally::new(campaigns, days);
     for t in &tallies {
@@ -855,7 +878,5 @@ fn run() {
         },
     );
     log(&format!("wrote {user_rows} user_daily rows"));
-    std::mem::forget(tallies);
-    std::mem::forget(events);
-    std::mem::forget(clicks);
+    std::mem::forget(tallies); // freeing costs time and the process ends now
 }

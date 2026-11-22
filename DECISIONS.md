@@ -13,6 +13,21 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Memory: pooled block lists on 2 MB huge pages
+- **Context:** A Linux experiment on 2M events (4 threads) split the parse pass: scan 0.029 s, + timestamps 0.053 s, + person lookup 0.077 s, full parse 0.083 s, **+ push into fresh memory 0.194 s**, + push into reused memory 0.115 s. Writing records into fresh memory cost more than all the parsing
+- **Options:**
+  - A) Bucket lists as chains of 64 KB blocks from one pool: never reallocated; a bucket's blocks go back to the pool after use and the next passes reuse them; slabs are 16 MB, 2 MB aligned, with `madvise(MADV_HUGEPAGE)`
+  - B) Allocator settings only: glibc `hugetlb`/mmap threshold 0.159 s, mimalloc with large pages 0.171–0.175 s, against 0.11 s reused
+  - C) One `mmap` huge-page region per thread (slower in this memory-starved VM: the kernel had to compact memory)
+- **Chose:** A
+- **Pros:**
+  - Linux proxy (2M, interleaved with #12): best 0.24–0.25 → 0.21–0.22 s, mean 0.292–0.295 → 0.245–0.253 s
+  - Page faults ~97–100k → ~18–22k. Holds whether the kernel's THP mode is `madvise` or `always`
+- **Cons / risks:**
+  - Some unsafe code (raw block pointers), kept in `blocks.rs`, with a unit test for push, iterate, release and reuse across types
+  - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds and at 2048 buckets
+- **Result:** — (attempt #13 pending)
+
 ## Output: one tally per thread, null and non-null rows in separate parts
 - **Context:** Linux `perf` on #11 (2M events): `Tally::merge` 2.7%; Parquet bit-packing of `top_category`'s null markers 3.5%. rayon's `fold` made a tally per work split, so dozens of ~1 MB campaign × day arrays were merged pairwise
 - **Options:** A) One tally per worker thread (the `per_thread` helper), merging only the campaign counts once. User rows stay in each thread's lists, split into "has a top category" and "none", one Parquet part each. B) Our own Parquet writer
@@ -23,7 +38,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Up to 2 × threads part files (16), which the rules allow
   - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds
   - Also tested and dropped: freeing the copy buffers after dedup, with and without glibc keeping freed memory. Interleaved A/B on 2M showed no difference (best 0.235 / 0.243 / 0.235 s)
-- **Result:** — (attempt #12 pending)
+- **Result:** Submitted together with #11 as `6ca30ff`: 2.6968 → 2.4810 s for both changes
 
 ## SIMD delimiter scan
 - **Context:** Scanning and per-line glue were the biggest cost on Linux (~27%). simdjson's stage 1 builds structural bitmasks 64 bytes at a time
@@ -33,7 +48,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Parse ~0.102 → ~0.093 s on the M1. Linux proxy (3M) 0.42 → 0.37 s
 - **Cons / risks:**
   - Arch-specific unsafe code. Fuzz test (50k random chunks up to 300 bytes) passes on arm64 and on x86-64 under emulation; the amd64 image matches the dev answer and 36/36 fixtures
-- **Result:** — (attempt #11 pending)
+- **Result:** Submitted together with #12 as `6ca30ff`: 2.6968 → 2.4810 s for both changes
 
 ## Bloom filter in front of the linked-ID table
 - **Context:** Every event and click looks up its ID in the linked-ID table, which at 20M holds ~1.2M entries of 48 bytes (~60 MB), far beyond a Xeon core's cache. 38% of events (dev set and 3M set) come from IDs in no link, which find nothing
