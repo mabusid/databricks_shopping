@@ -22,7 +22,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Merging runs counts each session once per campaign with no dedup step
 - **Cons / risks:**
   - Harder to read than B, so `tests/oracle.py` does B by brute force as the check
-- **Result:** — (no submission yet). Matches the oracle on 37/37, all 36 fixtures pass, and the dev answer matches exactly
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline. Matches the oracle on 37/37, all 36 fixtures pass, and the dev answer matches exactly
 
 ## Credit: backward join_asof
 - **Context:** Each session goes to the person's latest click at or before its start within 7 days, with ties going to the smallest `click_id`
@@ -33,7 +33,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Exact 7-day check in our code, not Polars' `tolerance`
 - **Cons / risks:**
   - Polars can't check sortedness with `by`. We sort on the key ourselves and pass `check_sortedness=False`
-- **Result:** — (no submission yet). Fixtures A1–A12 and L4 pass
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline. Fixtures A1–A12 and L4 pass
 
 ## Sessions: one sort, gap flags, running sum
 - **Context:** Step 5 splits each person's events into sessions at gaps over 30 minutes; events with equal timestamps must share a session
@@ -44,7 +44,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Equal timestamps have a gap of 0, so they share a session with no special case
 - **Cons / risks:**
   - The sort is on a string key, which may be slow at 60M rows; numbering persons as integers could help (step 8)
-- **Result:** — (no submission yet). `user_daily` matches all 36 fixtures and the dev answer exactly (118,107 rows)
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline. `user_daily` matches all 36 fixtures and the dev answer exactly (118,107 rows)
 
 ## Linked IDs: scipy connected components
 - **Context:** Step 4 must merge each person's IDs, through chains hundreds of links long and shared devices joining thousands of people
@@ -57,7 +57,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Adds numpy and scipy to the image (about 0.15 s to import when warm)
   - B would need a pass per link of chain length, unless sped up with pointer jumping
   - C is a few seconds slower at full size (it is the oracle's method)
-- **Result:** — (no submission yet). `tests/check_steps.py` matches the oracle's union-find on 37/37, and the L2 and L3 names match `fixtures/README.md`
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline. `tests/check_steps.py` matches the oracle's union-find on 37/37, and the L2 and L3 names match `fixtures/README.md`
 
 ## Test cleaning against a plain-Python oracle
 - **Context:** The fixtures check only the final tables, so they can't test step 3 until steps 4–6 exist
@@ -68,7 +68,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - The oracle can grow with steps 4–6
 - **Cons / risks:**
   - Both versions are ours and could share a misreading, so the counts were also checked against `fixtures/README.md`
-- **Result:** — (no submission yet). The check passes 37/37 (36 fixtures + dev set)
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline. The check passes 37/37 (36 fixtures + dev set)
 
 ## Our own timestamp parser
 - **Context:** The rules reject inputs that common parsers accept: lowercase `z`, offsets without a colon, second 60, Unicode digits, F3 values beyond 64 bits
@@ -78,7 +78,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Exact control, and still vectorized
 - **Cons / risks:**
   - More code. Every branch is computed for every row, which may cost time (profile at step 8)
-- **Result:** —
+- **Result:** Attempt #1 (28.4397 s), as part of the first full pipeline
 
 ## Engine: the Polars starter
 - **Context:** Only one starter can sit at the repo root, because the scorer builds one Dockerfile. Score is run time; the PySpark baseline is 169.6 s against a 180 s limit
@@ -92,7 +92,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Neither engine's reader follows the CSV rules on `\r` (fixture E20). Polars strips a trailing `\r`; DuckDB splits lines on it. Fix for step 3: read whole lines, and split any file that contains a `\r` exactly in Python (the generator never writes one)
   - Polars does not spill to disk the way DuckDB does, so 60M rows must fit in 24 GB with no swap. Convert to compact types early
   - PySpark ruled out: JVM start-up, and its baseline is already near the limit
-- **Result:** —
+- **Result:** Attempt #1: 28.4397 s on ~20M practice events, against the 167.6152 s baseline
 
 ## Correct first, fast second
 - **Context:** A nearly correct answer scores 0, whatever its speed. Baseline is 169.6 s; the hard limit is 3 min
@@ -103,7 +103,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - The fixtures catch rule mistakes early
 - **Cons / risks:**
   - The first version may need rework for speed
-- **Result:** —
+- **Result:** Attempt #1 scored (28.4397 s), so the first version was correct on the practice data
 
 ## Build step by step from an empty repo
 - **Context:** The first scaffold guessed the schemas and rules before we had rules.md or the starter
@@ -114,4 +114,4 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Each step is small enough to understand and test
 - **Cons / risks:**
   - Slower to a first submission; the deadline is Sunday 11:00 AM EST
-- **Result:** —
+- **Result:** Attempt #1 (28.4397 s) was the first submission, built one step at a time

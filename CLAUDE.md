@@ -4,7 +4,10 @@ Databricks "Shopping Sessions" track (Builders Buildathon). Turn ~60M messy
 click-stream CSV events in `/data` into two exact daily Parquet tables:
 `/output/user_daily/` (one row per person) and `/output/campaign_daily/`
 (one row per campaign). We submit a Dockerfile. Score = container run time,
-start to exit, lower is better. Hard limit 3 min. Baseline 169.6 s (PySpark).
+start to exit, lower is better. Baseline 167.6 s (PySpark). Practice runs
+use ~20M events (cap 2× baseline, max 5 min); the final uses ~60M events,
+3 runs, median, and any run over 3 min = no score. Practice can't show
+60M memory use (24 GB, no swap): check it by projection.
 Deadline: Sunday 11:00 AM EST.
 
 ## Rules of the road

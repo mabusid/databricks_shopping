@@ -4,6 +4,16 @@ Turn ~60M messy click-stream events into two exact daily Parquet tables
 (`/output/user_daily/`, `/output/campaign_daily/`), as fast as possible.
 Score = container run time, start to exit. A nearly correct answer scores 0.
 
+## Scoring (track page, scorer version shopping-sessions-5)
+- **Baseline:** 167.6152 s (PySpark, local mode).
+- **Practice:** about 20M events. Capped at 2× the baseline and never over 5 min. Runs under 20 s are timed 3 times and the median counts. 2 submissions per hour per team.
+- **Final:** the chosen commit is rebuilt and run 3 times on about 60M new events. The median counts, and any run over 3 min means no score. The top 30 are retimed 9 times across 3 fresh datasets, using the mean of the per-dataset medians. Ties go to the earlier submission.
+- **Container:** linux/amd64 image up to 8 GB; 8 vCPUs, 24 GB RAM, no swap; network only during the build (up to 10 min).
+  - Disk: `/output` + `/scratch` up to 50 GB; root is read-only except a 64 MB in-memory `/tmp`.
+  - Process: runs as uid 1000, at most 4,096 processes or threads, stdout up to 50 MB.
+- **Repo:** public, at most 50 MB, Dockerfile at the root, no data.
+- **Deadline:** Sun 11:00 AM EST.
+
 - `DECISIONS.md`: what we decided and why (newest first)
 - `SCORES.md`: every submission and its score
 - `rules/`: the official rules.md
@@ -27,5 +37,5 @@ make fixtures PLATFORM=linux/arm64 CPUS=4 MEM=3g                                
 4. [x] Join each person's IDs (checked by `tests/check_steps.py`)
 5. [x] Build sessions (`user_daily` matches all 36 fixtures and the dev answer)
 6. [x] Credit sessions to ad clicks, count assisting campaigns (both tables match the dev answer)
-7. [ ] All 36 fixtures pass → first submission
+7. [x] All 36 fixtures pass → first submission (attempt #1: 28.4397 s)
 8. [ ] Profile and optimize, one change per submission
