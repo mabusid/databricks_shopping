@@ -1099,12 +1099,22 @@ fn run() {
         let top = u.top.map_or(&b"\xffnull"[..], |c| category_names[c as usize]);
         row_hash(&[u.person, &u.day.to_le_bytes(), &u.sessions.to_le_bytes(), &u.events.to_le_bytes(), &u.revenue.to_le_bytes(), top])
     };
+    // Compact output stores sessions and events as INT32; a person-day has at most
+    // as many sessions and events as there are event lines, so they fit when that does.
+    let compact = output::compact() && event_bytes < i32::MAX as usize;
     let write_users = |part: usize, users: &[UserRow]| {
-        output::write_table(&out, "user_daily", part, output::USER_DAILY, vec![
+        let (schema, sessions, events) = if compact {
+            (output::USER_DAILY_32, Column::I32(users.iter().map(|u| u.sessions as i32).collect()),
+             Column::I32(users.iter().map(|u| u.events as i32).collect()))
+        } else {
+            (output::USER_DAILY, Column::I64(users.iter().map(|u| u.sessions).collect()),
+             Column::I64(users.iter().map(|u| u.events).collect()))
+        };
+        output::write_table(&out, "user_daily", part, schema, vec![
             Column::Str(users.iter().map(|u| u.person).collect()),
             Column::Date(users.iter().map(|u| u.day).collect()),
-            Column::I64(users.iter().map(|u| u.sessions).collect()),
-            Column::I64(users.iter().map(|u| u.events).collect()),
+            sessions,
+            events,
             Column::I64(users.iter().map(|u| u.revenue).collect()),
             Column::OptStr(users.iter().map(|u| u.top.map(|c| category_names[c as usize])).collect()),
         ])
