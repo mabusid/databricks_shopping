@@ -25,10 +25,10 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - Event type by length and one integer compare (no memcmp); small tables read while links build; 256 KB link chunks; input unmapped in parallel at the end
   - Linked-ID table and Bloom filter in one 2 MB-aligned huge-page mapping (the scorer only gives huge pages when asked)
 - **Pros:**
-  - Linux proxy (2M events, 4 threads, 10-12 interleaved runs): wall min/median 0.227/0.249 s (old) -> 0.161/0.201 s (records + writer) -> 0.153/0.171 s (scanner etc.)
+  - Linux proxy (2M events, 4 threads, 10-12 interleaved runs): wall min/median 0.227/0.249 s (old) -> 0.161/0.201 s (records + writer) -> 0.153/0.171 s (scanner etc.) -> 0.140/0.158 s (`0579c68`, all of the above)
 - **Cons / risks:**
   - The proxy can't show the scorer's memory costs; probe #5 (branch `probe5`) measures the new build there, with 4 KB pages, with 512 buckets, the old build, and 60M
-  - `SHOPPING_THP=0` (probes only) switches the arena to 4 KB pages
+  - Probe-only knobs, off by default: `SHOPPING_THP=0` (4 KB pages for the arena), `SHOPPING_POPULATE=1` (MADV_POPULATE_WRITE per 1 MB chunk). On the proxy (THP always) both are slightly slower; the scorer's THP is madvise-only, so probe #5 decides
 - **Result:** (pending submission of `lean`)
 
 ## Measured on the scorer (probe #3): what to keep
