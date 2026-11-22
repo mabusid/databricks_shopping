@@ -23,7 +23,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - pread input instead of mmap: 2.287 s, slower
   - Prefetch depth 16 (2.140), click prefetch ring (2.111): no gain
   - 2048 buckets (2.221), 16 threads (2.229): slower
-- **Result:** pending (the real submission of `step2` HEAD)
+- **Result:** attempt #15 (`99e28a7`): 2.0876 → 1.9925 s (−4.6%, less than the −18% on generated data). Probe #4 then put 35% of the parse stage (0.46 of 1.33 s at 20M) on writing records into fresh memory
 
 ## Scorer probes, and bundling changes they measured
 - **Context:** Practice runs hide our logs, and the local proxy can't show the scorer's costs (huge pages, mmap faults, how /data is mounted, exit teardown, AVX2). We are at 2.0876 s; the top is 0.4293 s, with ~7.5 h and 2 submissions an hour left. When a submission fails on the dev set, the scorer returns our logs
