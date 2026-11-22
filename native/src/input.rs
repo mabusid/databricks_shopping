@@ -24,15 +24,57 @@ pub fn csv_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// The whole file, memory-mapped for the life of the program.
+/// The whole file, memory-mapped for the life of the program (or, with
+/// SHOPPING_READ=1, only for probes: read with parallel 8 MB preads into memory).
 pub fn map(path: &Path) -> &'static [u8] {
     let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+    if len == 0 {
         return &[];
+    }
+    #[cfg(unix)]
+    if std::env::var("SHOPPING_READ").is_ok_and(|v| v == "1") {
+        return read_whole(&file, len, path);
     }
     let mmap = unsafe { Mmap::map(&file) }.unwrap_or_else(|e| panic!("mmap {}: {e}", path.display()));
     let mmap: &'static Mmap = Box::leak(Box::new(mmap));
     &mmap[..]
+}
+
+/// Read a whole file into fresh (lazily mapped, huge-page) memory with parallel preads.
+#[cfg(unix)]
+fn read_whole(file: &File, len: usize, path: &Path) -> &'static [u8] {
+    use rayon::prelude::*;
+    use std::os::unix::fs::FileExt;
+    // SAFETY: a fresh private anonymous mapping of `len` bytes, never unmapped.
+    let buf = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    assert!(buf != libc::MAP_FAILED, "mmap {}", path.display());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::madvise(buf, len, libc::MADV_HUGEPAGE);
+    }
+    let base = buf as usize;
+    const PIECE: usize = 8 << 20;
+    let got: usize = (0..len.div_ceil(PIECE)).into_par_iter().map(|i| {
+        let (off, n) = (i * PIECE, PIECE.min(len - i * PIECE));
+        // SAFETY: pieces are disjoint ranges of the mapping.
+        let dst = unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, n) };
+        let mut done = 0;
+        while done < n {
+            match file.read_at(&mut dst[done..], (off + done) as u64) {
+                Ok(0) => break,
+                Ok(k) => done += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("read {}: {e}", path.display()),
+            }
+        }
+        done
+    }).sum();
+    assert_eq!(got, len, "short read of {}", path.display());
+    // SAFETY: all `len` bytes were written above; the mapping lives forever.
+    unsafe { std::slice::from_raw_parts(base as *const u8, len) }
 }
 
 /// The data lines' bytes: everything after the header line. A later line equal
@@ -67,7 +109,8 @@ pub fn chunks(bodies: &[&'static [u8]], target: usize) -> Vec<&'static [u8]> {
 
 /// All chunks of all `*.csv` files in `dir`.
 pub fn dir_chunks(dir: &Path, target: usize) -> Vec<&'static [u8]> {
-    let bodies: Vec<&'static [u8]> = csv_files(dir).iter().map(|p| body(map(p))).collect();
+    use rayon::prelude::*;
+    let bodies: Vec<&'static [u8]> = csv_files(dir).par_iter().map(|p| body(map(p))).collect();
     chunks(&bodies, target)
 }
 
