@@ -282,6 +282,7 @@ fn masks64(b: &[u8; 64]) -> (u64, u64, u64) {
 /// and ends with a quote: any other quote makes the count too high.
 #[inline]
 #[allow(unused_assignments)] // the last end_line! resets state nobody reads
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn for_each_record_fused<const N: usize>(chunk: &'static [u8], mut f: impl FnMut(Option<[&'static [u8]; N]>)) {
     let n = chunk.len();
     let mut commas = [0usize; N]; // positions of the line's first N-1 commas
