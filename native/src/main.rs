@@ -17,7 +17,7 @@ mod parse;
 
 use foldhash::fast::FixedState;
 use hashbrown::hash_map::Entry;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashTable};
 use output::Column;
 use parse::{ts_ms, BAD};
 use rayon::prelude::*;
@@ -44,29 +44,57 @@ fn hasher() -> FixedState {
 }
 
 #[inline]
-fn bucket_of(key: Str) -> usize {
-    (hasher().hash_one(key) >> 56) as usize // the top 8 bits: 256 buckets
+fn hash(key: Str) -> u64 {
+    hasher().hash_one(key)
+}
+
+/// Each key is hashed once; the hash picks its bucket (top 8 bits: 256 buckets)
+/// and is reused in the bucket's hash table.
+#[inline]
+fn bucket(h: u64) -> usize {
+    (h >> 56) as usize
 }
 
 fn new_buckets<T>(capacity: usize) -> Vec<Vec<T>> {
     (0..BUCKETS).map(|_| Vec::with_capacity(capacity)).collect()
 }
 
-/// One copy of an event, as parsed. `ok`: rules 3-4 hold for this copy.
+/// One copy of an event, as parsed. `ok`: rules 3-4 hold for this copy. For a
+/// copy that is ok, its person and category are looked up while parsing,
+/// when the line is still in cache; for one that isn't they are left empty.
 struct EventCopy {
+    h: u64, // hash of event_id
     event_id: Str,
-    user_id: Str,
-    product_id: Str,
+    person: Str,
+    hp: u64, // hash of person
     ts: i64,
     ingest: i64,
     price: i32,
+    category: u16,
     event_type: u8,
     ok: bool,
+}
+
+/// Equal slices: the same bytes at the same place are equal without reading them
+/// (every ID of a linked person points at one shared name).
+#[inline]
+fn same(a: Str, b: Str) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
+}
+
+/// What parsing an event needs: the window and the lookups.
+struct Lookups<'a> {
+    start: i64,
+    end: i64,
+    links: &'a Links,
+    product_category: &'a Map<Str, u16>,
+    unknown: u16,
 }
 
 /// A surviving event, with its person.
 struct Event {
     person: Str,
+    hp: u64, // hash of person
     ts: i64,
     price: i32,
     category: u16,
@@ -76,6 +104,7 @@ struct Event {
 /// A valid click, with its person.
 struct Click {
     person: Str,
+    hp: u64, // hash of person
     ts: i64,
     click_id: Str,
     campaign: u32,
@@ -93,7 +122,8 @@ struct UserRow {
 
 /// Events rules 1 and 3-4 for one line: None if malformed or the event_id is empty.
 #[inline]
-fn parse_event(line: Str, start: i64, end: i64) -> Option<EventCopy> {
+fn parse_event(line: Str, lk: &Lookups) -> Option<EventCopy> {
+    let (start, end) = (lk.start, lk.end);
     let [event_id, user_id, ts, ingest, event_type, product_id, price] = input::fields::<7>(line)?;
     if event_id.is_empty() {
         return None;
@@ -117,12 +147,45 @@ fn parse_event(line: Str, start: i64, end: i64) -> Option<EventCopy> {
         && !product_id.is_empty()
         && price.is_some()
         && ingest - ts <= DAY; // late: strictly over 24 h (ts is in the window here, so no overflow)
-    Some(EventCopy { event_id, user_id, product_id, ts, ingest, price: price.unwrap_or(0) as i32, event_type, ok })
+    let (person, hp, category) = if ok {
+        let (person, hp) = lk.links.person_of(user_id);
+        let category = if event_type == PURCHASE {
+            lk.product_category.get(product_id).copied().unwrap_or(lk.unknown)
+        } else {
+            0
+        };
+        (person, hp, category)
+    } else {
+        (&[][..], 0, 0)
+    };
+    Some(EventCopy {
+        h: hash(event_id), event_id, person, hp, ts, ingest, price: price.unwrap_or(0) as i32, category, event_type, ok,
+    })
+}
+
+/// Each linked ID's person: the name and its hash.
+struct Links {
+    table: HashTable<(u64, u32)>, // (hash of ID, index into ids)
+    ids: Vec<Str>,
+    person: Vec<(Str, u64)>,
+}
+
+impl Links {
+    /// The person an ID belongs to, and the hash of the person's name. An ID in
+    /// no link is a person on its own, named by itself.
+    #[inline]
+    fn person_of(&self, id: Str) -> (Str, u64) {
+        let h = hash(id);
+        match self.table.find(h, |&(eh, i)| eh == h && self.ids[i as usize] == id) {
+            Some(&(_, i)) => self.person[i as usize],
+            None => (id, h),
+        }
+    }
 }
 
 /// Linked IDs rules 1-3: for every ID in a kept link line, the person's name
 /// (the byte-wise smallest ID joined to it, however many links apart).
-fn person_names(links_dir: &Path) -> Map<Str, Str> {
+fn person_names(links_dir: &Path) -> Links {
     let pairs: Vec<(Str, Str)> = input::dir_chunks(links_dir, CHUNK_BYTES)
         .par_iter()
         .flat_map_iter(|&chunk| {
@@ -171,7 +234,12 @@ fn person_names(links_dir: &Path) -> Map<Str, Str> {
             name[r] = ids[i]; // byte-wise smallest ID of the person
         }
     }
-    ids.iter().zip(&roots).map(|(&id, &r)| (id, name[r as usize])).collect()
+    let person: Vec<(Str, u64)> = roots.iter().map(|&r| (name[r as usize], hash(name[r as usize]))).collect();
+    let mut table = HashTable::with_capacity(ids.len());
+    for (i, &id) in ids.iter().enumerate() {
+        table.insert_unique(hash(id), (hash(id), i as u32), |e: &(u64, u32)| e.0);
+    }
+    Links { table, ids, person }
 }
 
 fn window(data: &Path) -> (i64, i64) {
@@ -235,16 +303,20 @@ struct Context {
 
 /// Events rules 5-7 and clicks rules 4-7 for the people of one bucket.
 fn person_bucket(events: Vec<&Event>, clicks: Vec<&Click>, cx: &Context, tally: &mut Tally) {
-    // Number the bucket's people, then sort events by (person, ts).
-    let mut number: Map<Str, u32> = Map::with_capacity_and_hasher(events.len() / 4 + 16, hasher());
+    // Number the bucket's people (by their stored hash), then sort events by (person, ts).
+    let mut number: HashTable<(u64, u32)> = HashTable::with_capacity(events.len() / 4 + 16);
     let mut names: Vec<Str> = Vec::new();
     let mut evs: Vec<(u32, i64, i32, u16, u8)> = events
         .iter()
         .map(|e| {
-            let id = *number.entry(e.person).or_insert_with(|| {
-                names.push(e.person);
-                (names.len() - 1) as u32
-            });
+            let id = match number.entry(e.hp, |&(h, i)| h == e.hp && same(names[i as usize], e.person), |x| x.0) {
+                hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
+                hashbrown::hash_table::Entry::Vacant(v) => {
+                    v.insert((e.hp, names.len() as u32));
+                    names.push(e.person);
+                    (names.len() - 1) as u32
+                }
+            };
             (id, e.ts, e.price, e.category, e.event_type)
         })
         .collect();
@@ -252,7 +324,11 @@ fn person_bucket(events: Vec<&Event>, clicks: Vec<&Click>, cx: &Context, tally: 
     // Clicks of people with events, by (person, ts, click_id) for credit and (person, campaign, ts) for assists.
     let mut cks: Vec<(u32, i64, Str, u32)> = clicks
         .iter()
-        .filter_map(|c| number.get(c.person).map(|&id| (id, c.ts, c.click_id, c.campaign)))
+        .filter_map(|c| {
+            number
+                .find(c.hp, |&(h, i)| h == c.hp && same(names[i as usize], c.person))
+                .map(|&(_, id)| (id, c.ts, c.click_id, c.campaign))
+        })
         .collect();
     cks.sort_unstable();
     let mut runs: Vec<(u32, u32, i64)> = cks.iter().map(|c| (c.0, c.3, c.1)).collect();
@@ -394,13 +470,21 @@ fn finish_row(mut row: UserRow, spend: &mut [i64], cx: &Context) -> UserRow {
 }
 
 fn main() {
+    if let Some(n) = std::env::var("NCPU").ok().and_then(|n| n.parse::<usize>().ok()) {
+        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
+    }
+    // SHOPPING_REPEAT=N runs the whole pipeline N times: only for profiling.
+    let repeat = std::env::var("SHOPPING_REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
+    for _ in 0..repeat {
+        run();
+    }
+}
+
+fn run() {
     let t0 = Instant::now();
     let log = |what: &str| eprintln!("{:8.3}s  {what}", t0.elapsed().as_secs_f64());
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    if let Some(n) = std::env::var("NCPU").ok().and_then(|n| n.parse::<usize>().ok()) {
-        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
-    }
 
     let (start, end) = window(&data);
     let base_day = start.div_euclid(DAY);
@@ -436,19 +520,19 @@ fn main() {
     }
     let campaigns = campaign_ids.len();
 
-    let names = person_names(&data.join("links"));
-    let person_of = |id: Str| -> Str { names.get(id).copied().unwrap_or(id) };
+    let links = person_names(&data.join("links"));
     log("small tables and linked IDs");
 
     // Pass 1: parse every event copy, bucketed by event_id.
+    let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
     let copies: Vec<Vec<Vec<EventCopy>>> = event_chunks
         .par_iter()
         .map(|&chunk| {
             let mut b = new_buckets(chunk.len() / 70 / BUCKETS * 5 / 4 + 8);
             input::for_each_line(chunk, |line| {
-                if let Some(c) = parse_event(line, start, end) {
-                    b[bucket_of(c.event_id)].push(c);
+                if let Some(c) = parse_event(line, &lookups) {
+                    b[bucket(c.h)].push(c);
                 }
             });
             b
@@ -462,31 +546,27 @@ fn main() {
         .into_par_iter()
         .map(|bi| {
             let n: usize = copies.iter().map(|c| c[bi].len()).sum();
-            let mut first: Map<Str, u32> = Map::with_capacity_and_hasher(n, hasher());
+            let mut first: HashTable<(u64, u32)> = HashTable::with_capacity(n); // (hash, index into kept)
             let mut kept: Vec<&EventCopy> = Vec::with_capacity(n);
             for c in copies.iter().flat_map(|c| &c[bi]) {
-                match first.entry(c.event_id) {
-                    Entry::Occupied(e) => {
-                        let k = *e.get() as usize;
+                match first.entry(c.h, |&(h, k)| h == c.h && same(kept[k as usize].event_id, c.event_id), |e| e.0) {
+                    hashbrown::hash_table::Entry::Occupied(e) => {
+                        let k = e.get().1 as usize;
                         if c.ingest < kept[k].ingest {
                             kept[k] = c; // copies with equal ingest_ts are identical
                         }
                     }
-                    Entry::Vacant(e) => {
-                        e.insert(kept.len() as u32);
+                    hashbrown::hash_table::Entry::Vacant(e) => {
+                        e.insert((c.h, kept.len() as u32));
                         kept.push(c);
                     }
                 }
             }
             let mut b = new_buckets(n / BUCKETS + 8);
             for c in kept.into_iter().filter(|c| c.ok) {
-                let person = person_of(c.user_id);
-                let category = if c.event_type == PURCHASE {
-                    product_category.get(c.product_id).copied().unwrap_or(unknown)
-                } else {
-                    0
-                };
-                b[bucket_of(person)].push(Event { person, ts: c.ts, price: c.price, category, event_type: c.event_type });
+                b[bucket(c.hp)].push(Event {
+                    person: c.person, hp: c.hp, ts: c.ts, price: c.price, category: c.category, event_type: c.event_type,
+                });
             }
             b
         })
@@ -511,8 +591,8 @@ fn main() {
                     return; // the click window, a week longer than the event window
                 }
                 let Some(&campaign) = campaign_index.get(campaign) else { return };
-                let person = person_of(user_id);
-                b[bucket_of(person)].push(Click { person, ts, click_id, campaign });
+                let (person, hp) = links.person_of(user_id);
+                b[bucket(hp)].push(Click { person, hp, ts, click_id, campaign });
             });
             b
         })
@@ -553,19 +633,24 @@ fn main() {
             }
         }
     }
+    // user_daily is large: one part file per thread, written in parallel.
+    let part_rows = users.len().div_ceil(rayon::current_num_threads()).max(1);
     rayon::join(
         || {
-            output::write_table(&out, "user_daily", output::USER_DAILY, vec![
-                Column::Str(users.iter().map(|u| u.person).collect()),
-                Column::Date(users.iter().map(|u| u.day).collect()),
-                Column::I64(users.iter().map(|u| u.sessions).collect()),
-                Column::I64(users.iter().map(|u| u.events).collect()),
-                Column::I64(users.iter().map(|u| u.revenue).collect()),
-                Column::OptStr(users.iter().map(|u| u.top.map(|c| category_names[c as usize])).collect()),
-            ])
+            let parts: Vec<&[UserRow]> = if users.is_empty() { vec![&users[..]] } else { users.chunks(part_rows).collect() };
+            parts.par_iter().enumerate().for_each(|(part, users)| {
+                output::write_table(&out, "user_daily", part, output::USER_DAILY, vec![
+                    Column::Str(users.iter().map(|u| u.person).collect()),
+                    Column::Date(users.iter().map(|u| u.day).collect()),
+                    Column::I64(users.iter().map(|u| u.sessions).collect()),
+                    Column::I64(users.iter().map(|u| u.events).collect()),
+                    Column::I64(users.iter().map(|u| u.revenue).collect()),
+                    Column::OptStr(users.iter().map(|u| u.top.map(|c| category_names[c as usize])).collect()),
+                ])
+            });
         },
         || {
-            output::write_table(&out, "campaign_daily", output::CAMPAIGN_DAILY, vec![
+            output::write_table(&out, "campaign_daily", 0, output::CAMPAIGN_DAILY, vec![
                 Column::Str(cols.0), Column::Str(cols.1), Column::Date(cols.2), Column::I64(cols.3),
                 Column::I64(cols.4), Column::I64(cols.5), Column::I64(cols.6),
             ])

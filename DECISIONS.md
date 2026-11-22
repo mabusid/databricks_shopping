@@ -13,6 +13,21 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Rust speed-ups, round 1
+- **Context:** Attempt #3 scored 5.9099 s. Stage timers on 3M events (Mac, best of 7) put the time in parse 0.10 s, dedup 0.13 s, the person pass 0.085 s and the Parquet write 0.10 s; the whole run took 0.479 s
+- **Options:** A) The fixes below, keeping every comparison exact. B) Also tell people apart by a 128-bit name hash instead of comparing names. C) Also match linked IDs by a 128-bit hash
+- **Chose:** A:
+  - Parquet: no statistics, and `user_daily` written as one part file per thread in parallel
+  - Each key is hashed once; `hashbrown::HashTable` reuses the stored hash
+  - The person and category are looked up while parsing, when the line is in cache
+  - Slices at the same address with the same length count as equal without reading their bytes
+- **Pros:**
+  - 3M events: ~0.479 → ~0.37 s. Write 0.10 → ~0.04 s, dedup 0.13 → ~0.035 s
+- **Cons / risks:**
+  - B saved only ~0.009 s and isn't exact (a 1-in-10^26 chance of merging two people), so it was reverted under "never trade correctness for speed"
+  - C gave no gain (the cost is the table probe, not the byte check), so it was reverted
+- **Result:** — (attempt #4 pending)
+
 ## Engine: rewrite as a native Rust binary
 - **Context:** The leaderboard top is ~0.5 s on the ~20M practice set; we are at ~28 s with Polars, and halving our local time (attempt #2) did not move the score. Python + Polars start-up alone is ~0.3 s, so the top can't be reached from there
 - **Options:** A) One Rust binary that reads the files directly from memory. It parses lines with a parser written for our CSV rules, runs hash-partitioned passes (dedup by `event_id`, then group by person), and does sessions, credit and assists per person in plain loops. B) Keep tuning Polars (maybe 10–15 s at best). C) C++
@@ -24,7 +39,7 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
   - A large rewrite with the deadline at Sun 11:00 AM EST
   - New code means new chances to be wrong, which scores 0
   - Mitigation: the Polars commit `82a5c68` (28.4511 s, correct) stays the fallback for the final, and the Dockerfile switches only once the Rust version passes every check
-- **Result:** —
+- **Result:** Attempt #3: 28.4511 → 5.9099 s
 
 ## Memory: compact event copies, cheaper dedup, free tables early
 - **Context:** The final uses ~60M events in 24 GB with no swap, and practice runs (~20M) can't show that. Peak memory footprint grew ~0.5 GB per 1M events (1M→3M, macOS), which projects to ~30 GB at 60M: out of memory, so no score

@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::{create_dir_all, File};
@@ -24,8 +24,9 @@ fn bytes(v: &[&'static [u8]]) -> Vec<ByteArray> {
     v.iter().map(|s| ByteArray::from(Bytes::from_static(s))).collect()
 }
 
-/// Write `columns` (named as in `schema`, same order) to `<out>/<table>/part-0.parquet`.
-pub fn write_table(out: &Path, table: &str, schema: &str, columns: Vec<Column>) {
+/// Write `columns` (named as in `schema`, same order) to `<out>/<table>/part-<part>.parquet`.
+/// A table may be split over several part files; the checker reads them all.
+pub fn write_table(out: &Path, table: &str, part: usize, schema: &str, columns: Vec<Column>) {
     let folder = out.join(table);
     create_dir_all(&folder).expect("create output folder");
     let schema = Arc::new(parse_message_type(schema).expect("schema"));
@@ -33,9 +34,10 @@ pub fn write_table(out: &Path, table: &str, schema: &str, columns: Vec<Column>) 
         WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None) // min/max nobody reads
             .build(),
     );
-    let file = File::create(folder.join("part-0.parquet")).expect("create parquet file");
+    let file = File::create(folder.join(format!("part-{part}.parquet"))).expect("create parquet file");
     let mut writer = SerializedFileWriter::new(file, schema, props).expect("parquet writer");
     let mut group = writer.next_row_group().expect("row group");
     for column in columns {
