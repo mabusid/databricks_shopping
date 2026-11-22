@@ -890,10 +890,14 @@ fn run() {
     // Pass 1: parse every event copy, bucketed by event_id.
     let lookups = Lookups { start, end, links: &links, product_category: &product_category, unknown };
     let event_chunks = input::dir_chunks(&data.join("events"), CHUNK_BYTES);
-    // 256 buckets. Scaling them with the input (2048 at 20M, to keep each dedup
-    // table in L2) made attempt #6 slower: the wider scatter while parsing cost
-    // more. SHOPPING_BUCKET_BITS overrides it, only for testing other counts.
-    let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(8);
+    // 256 buckets, or 1024 for inputs over 1 GB of events (~10M+), so each
+    // bucket's dedup table (~20k events at 20M) fits a Xeon core's L2. Attempt #6
+    // tried 2048 with growing Vecs and was slower (the scatter into fresh,
+    // pre-reserved memory); block lists made the scatter cheap.
+    // SHOPPING_BUCKET_BITS overrides it, only for testing other counts.
+    let event_bytes: usize = event_chunks.iter().map(|c| c.len()).sum();
+    let default_bits = if event_bytes > 1 << 30 { 10 } else { 8 };
+    let bits = std::env::var("SHOPPING_BUCKET_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(default_bits);
     BUCKET_BITS.store(bits, std::sync::atomic::Ordering::Relaxed);
     let threads = rayon::current_num_threads();
     // Bucket lists are kept per worker thread, not per chunk, so their number

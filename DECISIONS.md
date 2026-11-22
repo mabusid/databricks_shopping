@@ -13,6 +13,21 @@ Scores live in SCORES.md; link the attempt number here when a decision is tested
 - **Result:** attempt #N, score X → Y, or "reverted"
 -->
 
+## Experiment: 1024 buckets for large inputs, with block lists
+- **Context:** At 20M events, 256 buckets mean ~78k events per dedup table (~1.25 MB), beyond a Xeon core's 1 MB L2. Attempt #6 tried 2048 buckets with growing `Vec`s and lost ~0.06 s, mostly from scattering into fresh, pre-reserved memory. Block lists (#13) have since made the scatter cheap
+- **Options:** A) 1024 buckets when the events exceed 1 GB (~10M+; ~20k events per table at 20M), else 256. B) Stay at 256
+- **Chose:** A, as a one-change experiment. The M1 can't show the effect: its caches hold the tables, and our test data is below 1 GB
+- **Pros:**
+  - Dedup and person-pass tables should fit L2 on the scorer
+- **Cons / risks:**
+  - Wider scatter (1024 list tails per thread) and more partly filled blocks
+  - If the score gets worse, revert to 256
+  - Checks: 36/36 fixtures, dev answer, Rust = Polars on 10 seeds at 1024 buckets (forced) and at 256
+- **Result:** — (attempt #17 pending)
+
+## Tried and dropped: the prefetch pipeline for clicks
+- Same technique as #16, applied to click lookups. Linux proxy (2M, 16 interleaved runs vs #16): best 0.212 vs 0.212 s, median 0.293 vs 0.244 s. No gain (click lookups are a small cost), so not kept
+
 ## Person lookups: flat link table, prefetched 8 lines ahead
 - **Context:** In the parse-pass split, the person lookup added 0.030 s at 2M (~57 ns a line), mostly waiting on memory for the table probe. At 20M the linked-ID table is ~10× bigger than a Xeon core's cache
 - **Options:** A) Our own open-addressing table (40-byte slots holding the ID key, person key and packed name; linear probing, at most half full; one table per part, built in parallel), plus a software pipeline: each parsed copy computes its key, checks the Bloom filter and prefetches its slot, then waits in an 8-slot ring; its person is filled in when it leaves. B) Keep hashbrown (its slots can't be prefetched from outside)
