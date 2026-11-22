@@ -64,7 +64,7 @@ if awk "BEGIN{exit !($(el) < 85)}"; then
   t=$EPOCHREALTIME
   timeout 70 /app/generate --seed 2 --events "$EV60" --clicks $((EV60 / 4)) --output "$S/g60" >/dev/null
   echo "generate exit $? in $(awk "BEGIN{printf \"%.2f\", $EPOCHREALTIME - $t}")s"; du -sh "$S/g60"/*
-  if awk "BEGIN{exit !($(el) < 140)}"; then run "60M v3" /app/shopping-v3 "$S/g60"; fi
+  if awk "BEGIN{exit !($(el) < 140)}"; then run "60M base" /app/shopping-base "$S/g60"; fi
 else
   echo "skipping 60M (at $(el)s)"
 fi
