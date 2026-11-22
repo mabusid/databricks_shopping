@@ -1,0 +1,8 @@
+d-v3 d_now-v3
+k-v3 k-v3
+k-s4 k-v3 SHOPPING_SKIP=4
+k-s5 k-v3 SHOPPING_SKIP=5
+k-s7 k-v3 SHOPPING_SKIP=7
+k-s31 k-v3 SHOPPING_SKIP=31
+k-s32 k-v3 SHOPPING_SKIP=32
+k-v4 k-v4
