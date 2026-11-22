@@ -41,7 +41,9 @@ pub fn init(bytes: usize) {
     #[cfg(target_os = "linux")]
     // SAFETY: the range lies inside the reservation; advice never changes its contents.
     unsafe {
-        libc::madvise(base as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+        // SHOPPING_THP=0 (probes): 4 KB pages instead (no compaction stalls for huge pages).
+        let advice = if std::env::var("SHOPPING_THP").is_ok_and(|v| v == "0") { libc::MADV_NOHUGEPAGE } else { libc::MADV_HUGEPAGE };
+        libc::madvise(base as *mut libc::c_void, bytes, advice);
     }
     ARENA_BYTES.store(bytes, Relaxed);
     BASE.store(base, Relaxed);
