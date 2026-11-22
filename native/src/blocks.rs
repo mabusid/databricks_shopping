@@ -84,6 +84,30 @@ pub fn at<T>(r: u32) -> *mut T {
     (BASE.load(Relaxed) + ((r as usize) << 3)) as *mut T
 }
 
+/// `n` zeroed `T`s in their own mapping, advised to use 2 MB huge pages (big
+/// random-access tables: far fewer TLB misses). Never freed.
+///
+/// # Safety
+/// All-zero bytes must be a valid `T`.
+pub unsafe fn huge_zeroed<T>(n: usize) -> &'static mut [T] {
+    const ALIGN: usize = 2 << 20;
+    let bytes = (n * std::mem::size_of::<T>()).max(1);
+    // SAFETY: a fresh private anonymous mapping (zero-filled), never unmapped;
+    // 2 MB more than needed so the table can start on a huge-page boundary.
+    let raw = unsafe {
+        libc::mmap(std::ptr::null_mut(), bytes + ALIGN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    assert!(raw != libc::MAP_FAILED, "mmap table");
+    let p = ((raw as usize + ALIGN - 1) & !(ALIGN - 1)) as *mut libc::c_void;
+    #[cfg(target_os = "linux")]
+    // SAFETY: the range is exactly the mapping just made.
+    unsafe {
+        libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+    }
+    // SAFETY: page-aligned (so aligned for T), zeroed, and zero is a valid T (caller).
+    unsafe { std::slice::from_raw_parts_mut(p as *mut T, n) }
+}
+
 /// One finished list of `T` (read side).
 pub struct BlockList<T: Copy> {
     blocks: Vec<*mut T>,

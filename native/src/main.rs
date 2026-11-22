@@ -379,14 +379,20 @@ const NO_KEY: PersonKey = (0, 0);
 
 /// One part's table: open addressing, linear probing, at most half full.
 struct LinkPart {
-    slots: Vec<LinkSlot>,
+    slots: &'static [LinkSlot],
     mask: usize,
 }
 
 impl LinkPart {
-    fn build(entries: &[LinkSlot]) -> LinkPart {
-        let cap = (entries.len() * 2).max(16).next_power_of_two();
-        let mut slots = vec![LinkSlot { id: NO_KEY, person: 0, name: PStr(0) }; cap];
+    /// Slots for `entries`: a power of two, at least twice as many.
+    fn capacity(entries: usize) -> usize {
+        (entries * 2).max(16).next_power_of_two()
+    }
+
+    /// Fill `slots` (all empty, `capacity(entries.len())` of them) with `entries`.
+    fn build(entries: &[LinkSlot], slots: &'static mut [LinkSlot]) -> LinkPart {
+        let cap = slots.len();
+        debug_assert_eq!(cap, Self::capacity(entries.len()));
         for e in entries {
             let mut i = e.id.0 as usize & (cap - 1);
             while slots[i].id != NO_KEY {
@@ -454,7 +460,7 @@ struct Links {
     /// A Bloom filter of every linked ID's key: 8+ bits per ID, 2 bits set each.
     /// A clear bit means "in no link" for sure, so most one-ID people skip the
     /// big table (which at 20M is far larger than a Xeon core's cache).
-    bloom: Vec<u64>,
+    bloom: &'static [u64],
     bloom_mask: u64, // number of 512-bit blocks - 1
 }
 
@@ -653,19 +659,26 @@ fn person_names(links_dir: &Path) -> Links {
         })
         .collect();
     let zero = slots.iter().flatten().find(|e| e.id == NO_KEY).map(|e| (e.name, e.person));
-    let parts: Vec<LinkPart> = slots
-        .par_iter()
-        .map(|entries| {
-            let real: Vec<LinkSlot> = entries.iter().filter(|e| e.id != NO_KEY).copied().collect();
-            LinkPart::build(&real)
-        })
-        .collect();
+    // All parts' slots in one huge-page table (one random access per event lands here).
+    let reals: Vec<Vec<LinkSlot>> =
+        slots.par_iter().map(|entries| entries.iter().filter(|e| e.id != NO_KEY).copied().collect()).collect();
+    let caps: Vec<usize> = reals.iter().map(|r| LinkPart::capacity(r.len())).collect();
+    // SAFETY: all-zero bytes are a valid LinkSlot (an empty one: id NO_KEY, PStr(0)).
+    let mut table: &'static mut [LinkSlot] = unsafe { blocks::huge_zeroed(caps.iter().sum()) };
+    let mut pieces = Vec::with_capacity(LINK_PARTS);
+    for &cap in &caps {
+        let (piece, rest) = std::mem::take(&mut table).split_at_mut(cap);
+        pieces.push(piece);
+        table = rest;
+    }
+    let parts: Vec<LinkPart> = reals.par_iter().zip(pieces).map(|(real, piece)| LinkPart::build(real, piece)).collect();
     lmark("tables");
     // Bloom filter: at least 8 bits per ID (a power of two), at least 2^16 bits.
     let bits = (n * 8).max(1 << 16).next_power_of_two();
-    let mut links = Links { parts, zero, bloom: Vec::new(), bloom_mask: (bits / 512 - 1) as u64 };
+    let mut links = Links { parts, zero, bloom: &[], bloom_mask: (bits / 512 - 1) as u64 };
     // Set every key's two bits, all parts in parallel (atomic OR; order doesn't matter).
-    let words: Vec<std::sync::atomic::AtomicU64> = (0..bits / 64).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    // SAFETY: an all-zero AtomicU64 is a valid (zero) value.
+    let words: &'static [std::sync::atomic::AtomicU64] = unsafe { blocks::huge_zeroed(bits / 64) };
     numbered.par_iter().for_each(|(keys, _, _)| {
         for &k in keys {
             let (a, b) = links.bloom_bits(k);
@@ -673,7 +686,9 @@ fn person_names(links_dir: &Path) -> Links {
             words[b / 64].fetch_or(1 << (b % 64), Relaxed);
         }
     });
-    links.bloom = words.into_iter().map(|w| w.into_inner()).collect();
+    // SAFETY: every write above is done (the parallel loop has joined); AtomicU64
+    // has the same layout as u64, and the words are never written again.
+    links.bloom = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u64, words.len()) };
     lmark("bloom");
     links
 }
